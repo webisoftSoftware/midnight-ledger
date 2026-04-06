@@ -1288,7 +1288,7 @@ impl DustLocalStateWithChanges {
 }
 
 #[wasm_bindgen]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DustLocalState(pub(crate) LedgerDustLocalState<InMemoryDB>);
 
 #[wasm_bindgen]
@@ -1483,6 +1483,54 @@ impl DustLocalState {
         let sk = sk.try_unwrap()?;
         let events = events.iter().map(|event| &event.0);
         Ok(DustLocalState(self.0.replay_events(&sk, events)?))
+    }
+
+    /// Parses a MNCX .bin container and replays all dust events with full
+    /// processing.  All heavy lifting in WASM — no JS boundary crossings.
+    #[wasm_bindgen(js_name = "replayEventsFromBin")]
+    pub fn replay_events_from_bin(
+        &self,
+        sk: &DustSecretKey,
+        bin_data: &[u8],
+    ) -> Result<DustBinReplayResult, JsError> {
+        use serialize::tagged_deserialize;
+
+        let sk_inner = sk.try_unwrap()?;
+
+        const HEADER_SIZE: usize = 21;
+        const RECORD_HEADER_SIZE: usize = 12;
+
+        if bin_data.len() < HEADER_SIZE || &bin_data[0..4] != b"MNCX" {
+            return Err(JsError::new("Invalid MNCX container"));
+        }
+        let last_event_id = u64::from_le_bytes(bin_data[5..13].try_into().unwrap());
+        let event_count = u64::from_le_bytes(bin_data[13..21].try_into().unwrap());
+
+        let mut events: Vec<LedgerEvent<InMemoryDB>> = Vec::with_capacity(event_count as usize);
+        let mut offset = HEADER_SIZE;
+        while offset + RECORD_HEADER_SIZE <= bin_data.len() {
+            let payload_len = u32::from_le_bytes(
+                bin_data[offset + 8..offset + 12].try_into().unwrap(),
+            ) as usize;
+            let payload_start = offset + RECORD_HEADER_SIZE;
+            let payload_end = payload_start + payload_len;
+            if payload_end > bin_data.len() {
+                return Err(JsError::new("MNCX record exceeds bounds"));
+            }
+            let event: LedgerEvent<InMemoryDB> =
+                tagged_deserialize(&mut &bin_data[payload_start..payload_end])
+                    .map_err(|e| JsError::new(&format!("Dust event deserialize: {e}")))?;
+            events.push(event);
+            offset = payload_end;
+        }
+
+        let event_refs = events.iter().map(|e| e);
+        let new_state = self.0.replay_events(&sk_inner, event_refs)?;
+        Ok(DustBinReplayResult {
+            state: DustLocalState(new_state),
+            last_event_id,
+            event_count,
+        })
     }
 
     #[wasm_bindgen(js_name = "replayEventsWithChanges")]
@@ -1704,5 +1752,31 @@ impl DustStateMerkleTreeCollapsedUpdate {
         } else {
             format!("{:#?}", &self.0)
         }
+    }
+}
+
+/// Result of replaying dust events from a MNCX .bin container.
+#[wasm_bindgen]
+pub struct DustBinReplayResult {
+    state: DustLocalState,
+    last_event_id: u64,
+    event_count: u64,
+}
+
+#[wasm_bindgen]
+impl DustBinReplayResult {
+    #[wasm_bindgen(getter)]
+    pub fn state(&self) -> DustLocalState {
+        self.state.clone()
+    }
+
+    #[wasm_bindgen(getter, js_name = "lastEventId")]
+    pub fn last_event_id(&self) -> u64 {
+        self.last_event_id
+    }
+
+    #[wasm_bindgen(getter, js_name = "eventCount")]
+    pub fn event_count(&self) -> u64 {
+        self.event_count
     }
 }

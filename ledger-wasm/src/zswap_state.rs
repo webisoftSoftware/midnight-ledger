@@ -26,6 +26,7 @@ use coin_structure::{
     contract::ContractAddress as Address,
 };
 use js_sys::{Array, Date, JsString, Map, Set, Uint8Array};
+use ledger::events::Event as LedgerEvent;
 use ledger::semantics::ZswapLocalStateExt;
 use ledger::zswap::WithZswapStateChanges;
 use onchain_runtime_wasm::from_value_ser;
@@ -194,6 +195,61 @@ impl ZswapLocalState {
         Ok(ZswapLocalState(
             self.0.replay_events(&secret_keys.try_into()?, events)?,
         ))
+    }
+
+    /// Replays events updating only the Merkle tree — no trial decryption.
+    /// Much faster than `replayEvents` when coin discovery is not needed.
+    #[wasm_bindgen(js_name = "replayEventsTreeOnly")]
+    pub fn replay_events_tree_only(
+        &self,
+        events: Vec<Event>,
+    ) -> Result<ZswapLocalState, JsError> {
+        let events = events.iter().map(|event| &event.0);
+        Ok(ZswapLocalState(
+            self.0.replay_events_tree_only(events)?,
+        ))
+    }
+
+    /// Parses a MNCX .bin container and replays all events, building the
+    /// Merkle tree only (no trial decryption).  Returns the updated state
+    /// and the lastEventId from the container header.
+    ///
+    /// This does all heavy lifting in WASM — no JS-WASM boundary crossings
+    /// per event.
+    #[wasm_bindgen(js_name = "replayEventsTreeOnlyFromBin")]
+    pub fn replay_events_tree_only_from_bin(
+        &self,
+        bin_data: &[u8],
+    ) -> Result<BinReplayResult, JsError> {
+        let (header, events) = parse_mncx_events(bin_data)?;
+        let event_refs: Vec<_> = events.iter().collect();
+        let new_state = self.0.replay_events_tree_only(event_refs.into_iter())?;
+        Ok(BinReplayResult {
+            state: ZswapLocalState(new_state),
+            last_event_id: header.last_event_id,
+            event_count: header.event_count,
+        })
+    }
+
+    /// Parses a MNCX .bin container and replays all events with full
+    /// processing (Merkle tree + trial decryption).  Used for wallet imports.
+    ///
+    /// This does all heavy lifting in WASM — no JS-WASM boundary crossings
+    /// per event.
+    #[wasm_bindgen(js_name = "replayEventsFromBin")]
+    pub fn replay_events_from_bin(
+        &self,
+        secret_keys: &ZswapSecretKeys,
+        bin_data: &[u8],
+    ) -> Result<BinReplayResult, JsError> {
+        let (header, events) = parse_mncx_events(bin_data)?;
+        let event_refs: Vec<_> = events.iter().collect();
+        let new_state = self.0.replay_events(&secret_keys.try_into()?, event_refs.into_iter())?;
+        Ok(BinReplayResult {
+            state: ZswapLocalState(new_state),
+            last_event_id: header.last_event_id,
+            event_count: header.event_count,
+        })
     }
 
     #[wasm_bindgen(js_name = "replayEventsWithChanges")]
@@ -464,3 +520,82 @@ fn construct_apply_result(
     res.push(&JsValue::from(indicies_res));
     Ok(res.into())
 }
+
+// ── MNCX .bin container parsing ──
+
+const MNCX_MAGIC: &[u8; 4] = b"MNCX";
+const MNCX_HEADER_SIZE: usize = 21;
+const MNCX_RECORD_HEADER_SIZE: usize = 12;
+
+struct MncxHeader {
+    last_event_id: u64,
+    event_count: u64,
+}
+
+fn parse_mncx_events(
+    data: &[u8],
+) -> Result<(MncxHeader, Vec<LedgerEvent<InMemoryDB>>), JsError> {
+    use serialize::tagged_deserialize;
+
+    if data.len() < MNCX_HEADER_SIZE {
+        return Err(JsError::new("MNCX bin too short for header"));
+    }
+    if &data[0..4] != MNCX_MAGIC {
+        return Err(JsError::new("Invalid MNCX magic"));
+    }
+    // data[4] = version (1)
+    let last_event_id = u64::from_le_bytes(data[5..13].try_into().unwrap());
+    let event_count = u64::from_le_bytes(data[13..21].try_into().unwrap());
+
+    let mut events = Vec::with_capacity(event_count as usize);
+    let mut offset = MNCX_HEADER_SIZE;
+
+    while offset + MNCX_RECORD_HEADER_SIZE <= data.len() {
+        // skip event_id (8 bytes), read payload length (4 bytes)
+        let payload_len =
+            u32::from_le_bytes(data[offset + 8..offset + 12].try_into().unwrap()) as usize;
+        let payload_start = offset + MNCX_RECORD_HEADER_SIZE;
+        let payload_end = payload_start + payload_len;
+        if payload_end > data.len() {
+            return Err(JsError::new("MNCX record exceeds data bounds"));
+        }
+        let event: LedgerEvent<InMemoryDB> =
+            tagged_deserialize(&mut &data[payload_start..payload_end]).map_err(|e| {
+                JsError::new(&format!("Failed to deserialize event: {}", e))
+            })?;
+        events.push(event);
+        offset = payload_end;
+    }
+
+    Ok((MncxHeader { last_event_id, event_count }, events))
+}
+
+/// Result of replaying events from a MNCX .bin container.
+#[wasm_bindgen]
+pub struct BinReplayResult {
+    state: ZswapLocalState,
+    last_event_id: u64,
+    event_count: u64,
+}
+
+#[wasm_bindgen]
+impl BinReplayResult {
+    /// The updated ZswapLocalState after replay.
+    #[wasm_bindgen(getter)]
+    pub fn state(&self) -> ZswapLocalState {
+        self.state.clone()
+    }
+
+    /// The lastEventId from the MNCX header — use as appliedIndex.
+    #[wasm_bindgen(getter, js_name = "lastEventId")]
+    pub fn last_event_id(&self) -> u64 {
+        self.last_event_id
+    }
+
+    /// Number of events in the container.
+    #[wasm_bindgen(getter, js_name = "eventCount")]
+    pub fn event_count(&self) -> u64 {
+        self.event_count
+    }
+}
+

@@ -145,6 +145,15 @@ pub trait ZswapLocalStateExt<D: DB>: Sized {
         secret_keys: &SecretKeys,
         events: impl IntoIterator<Item = &'a Event<D>>,
     ) -> Result<WithZswapStateChanges<Self>, EventReplayError>;
+    /// Replays events updating only the Merkle tree structure (commitments +
+    /// collapse) without performing trial decryption.  No coins are discovered.
+    /// This is O(n) tree insertions + a single rehash — no elliptic curve
+    /// operations.
+    #[must_use = "return value must be used"]
+    fn replay_events_tree_only<'a>(
+        &self,
+        events: impl IntoIterator<Item = &'a Event<D>>,
+    ) -> Result<Self, EventReplayError>;
 }
 
 impl<D: DB> ZswapLocalStateExt<D> for ZswapLocalState<D> {
@@ -333,6 +342,39 @@ impl<D: DB> ZswapLocalStateExt<D> for ZswapLocalState<D> {
         )?;
         res.result.merkle_tree = res.result.merkle_tree.rehash();
 
+        Ok(res)
+    }
+
+    fn replay_events_tree_only<'a>(
+        &self,
+        events: impl IntoIterator<Item = &'a Event<D>>,
+    ) -> Result<Self, EventReplayError> {
+        let mut res = events.into_iter().try_fold(self.clone(), |mut acc, event| {
+            match &event.content {
+                EventDetails::ZswapOutput {
+                    commitment,
+                    mt_index,
+                    ..
+                } => {
+                    if *mt_index != acc.first_free {
+                        return Err(EventReplayError::NonLinearInsertion {
+                            expected_next: acc.first_free,
+                            received: *mt_index,
+                            tree_name: "zswap commitment",
+                        });
+                    }
+                    acc.merkle_tree =
+                        acc.merkle_tree.update_hash(*mt_index, commitment.0, ())?;
+                    acc.first_free += 1;
+                    // No trial decryption — collapse immediately
+                    acc.merkle_tree = acc.merkle_tree.collapse(*mt_index, *mt_index);
+                }
+                // ZswapInput: no tree changes needed, skip
+                _ => {}
+            }
+            Ok(acc)
+        })?;
+        res.merkle_tree = res.merkle_tree.rehash();
         Ok(res)
     }
 }
