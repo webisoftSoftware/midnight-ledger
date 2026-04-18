@@ -320,6 +320,18 @@ impl Debug for MerkleTreeCollapsedUpdate {
 }
 
 impl MerkleTreeCollapsedUpdate {
+    /// Public accessor for `step_sizes` — used by the batch Merkle hash
+    /// builder in `ledger-wasm` to compute collapsed updates without a tree.
+    pub fn step_sizes_pub(a: u64, b: u64) -> Vec<u8> {
+        Self::step_sizes(a, b)
+    }
+
+    /// Constructs a `MerkleTreeCollapsedUpdate` from pre-computed hashes.
+    /// The caller is responsible for ensuring the hashes match `step_sizes(start, end + 1)`.
+    pub fn from_raw(start: u64, end: u64, hashes: Vec<MerkleTreeDigest>) -> Self {
+        Self { start, end, hashes }
+    }
+
     fn step_sizes(mut a: u64, b: u64) -> Vec<u8> {
         // A hash of height 0 can step from x to x+1
         // A hash of height h can step from x to x+(2^h) IF 2^h | x
@@ -458,7 +470,7 @@ impl<'de, A: Deserialize<'de> + Storable<D>, D: DB> Deserialize<'de> for MerkleT
             Deserialize::deserialize(de)?;
         data.into_iter()
             .try_fold(MerkleTree::blank(height), |mt, (k, (v, a))| {
-                MerkleTree::update_hash(&mt, k, v, a)
+                MerkleTree::try_update_hash(&mt, k, v, a)
                     .map_err(<D2::Error as serde::de::Error>::custom)
             })
     }
@@ -510,10 +522,10 @@ impl<Faker, D: DB> fake::Dummy<Faker> for MerkleTree<(), D> {
         // TODO: make random trees!
         let mut mt = MerkleTree::<(), D>::blank(32);
         if let Ok(updated) = mt
-            .update(0, &Fr::from(42u64), ())
-            .and_then(|mt| mt.update(0, &Fr::from(41u64), ()))
-            .and_then(|mt| mt.update(3, &Fr::from(43u64), ()))
-            .and_then(|mt| mt.update(62, &Fr::from(12u64), ()))
+            .try_update(0, &Fr::from(42u64), ())
+            .and_then(|mt| mt.try_update(0, &Fr::from(41u64), ()))
+            .and_then(|mt| mt.try_update(3, &Fr::from(43u64), ()))
+            .and_then(|mt| mt.try_update(62, &Fr::from(12u64), ()))
         {
             mt = updated;
         }
@@ -722,10 +734,26 @@ impl<A: Storable<D>, D: DB> MerkleTreeNode<A, D> {
         }
         let entry = path.last().expect("non-empty");
         Ok(match self {
-            Collapsed { height, .. } => Collapsed {
-                hash: entry.hash.ok_or(InvalidUpdate::BadUpdatePath)?.0,
-                height: *height,
-            },
+            Collapsed { height, hash } => {
+                // Expand collapsed node: split into Node with evidence path
+                // on one side and a Collapsed sibling (hash from evidence) on the other.
+                let sibling_hash = entry.hash.ok_or(InvalidUpdate::BadUpdatePath)?.0;
+                let sibling = Sp::new(Collapsed {
+                    hash: sibling_hash,
+                    height: height - 1,
+                });
+                // Recurse into a placeholder child — it gets replaced by the recursion.
+                // The placeholder hash is unused since every level gets expanded.
+                let placeholder = Collapsed { hash: *hash, height: height - 1 };
+                let child = Sp::new(
+                    placeholder.update_from_evidence_internal(leaf, &path[..path.len() - 1])?,
+                );
+                if entry.goes_left {
+                    Node { hash: None, left: child, right: sibling, height: *height }
+                } else {
+                    Node { hash: None, left: sibling, right: child, height: *height }
+                }
+            }
             Node {
                 left,
                 right,
@@ -928,7 +956,15 @@ impl<A: Storable<D>, D: DB> MerkleTreeNode<A, D> {
 
     /// Inserts a hash value at a specific index, returning the resulting tree.
     /// `index` *must* be within range of the tree height.
-    pub fn update_hash(
+    #[deprecated = "This version panics rather than throwing errors. Prefer `try_update_hash`."]
+    pub fn update_hash(&self, index: u64, new_leaf: HashOutput, new_aux: A) -> Sp<Self, D> {
+        self.try_update_hash(index, new_leaf, new_aux)
+            .expect("attempted update into collapsed tree")
+    }
+
+    /// Inserts a hash value at a specific index, returning the resulting tree.
+    /// `index` *must* be within range of the tree height.
+    pub fn try_update_hash(
         &self,
         index: u64,
         new_leaf: HashOutput,
@@ -966,11 +1002,14 @@ impl<A: Storable<D>, D: DB> MerkleTreeNode<A, D> {
             // Here `index < cmp` is the same as `index & cmp == 0`, i.e. we're
             // checking if the height `h` bit in the path is set or not.
             let (left, right) = if index < cmp {
-                (left.update_hash(index, new_leaf, new_aux)?, right.clone())
+                (
+                    left.try_update_hash(index, new_leaf, new_aux)?,
+                    right.clone(),
+                )
             } else {
                 (
                     left.clone(),
-                    right.update_hash(index - cmp, new_leaf, new_aux)?,
+                    right.try_update_hash(index - cmp, new_leaf, new_aux)?,
                 )
             };
             Ok(Sp::new(Node {
@@ -1017,13 +1056,21 @@ impl<A: Storable<D>, D: DB> MerkleTree<A, D> {
 
     /// Inserts a hash value at a specific index, returning the resulting tree.
     /// `index` *must* be within range of the tree height.
-    pub fn update_hash(
+    #[deprecated = "This version panics rather than throwing errors. Prefer `try_update_hash`."]
+    pub fn update_hash(&self, index: u64, new_leaf: HashOutput, aux: A) -> Self {
+        #[allow(deprecated)]
+        MerkleTree(self.0.update_hash(index, new_leaf, aux))
+    }
+
+    /// Inserts a hash value at a specific index, returning the resulting tree.
+    /// `index` *must* be within range of the tree height.
+    pub fn try_update_hash(
         &self,
         index: u64,
         new_leaf: HashOutput,
         aux: A,
     ) -> Result<Self, InvalidUpdate> {
-        Ok(MerkleTree(self.0.update_hash(index, new_leaf, aux)?))
+        Ok(MerkleTree(self.0.try_update_hash(index, new_leaf, aux)?))
     }
 
     /// Inserts a value into a specific index of the tree.
@@ -1032,16 +1079,20 @@ impl<A: Storable<D>, D: DB> MerkleTree<A, D> {
     ///
     /// May panic if this index was previously in a range passed to
     /// [`collapse`](crate::merkle_tree::MerkleTree::collapse).
-    pub fn update<T: BinaryHashRepr + ?Sized>(
+    #[deprecated = "This version panics rather than throwing errors. Prefer `try_update_hash`."]
+    pub fn update<T: BinaryHashRepr + ?Sized>(&self, index: u64, value: &T, aux: A) -> Self {
+        #[allow(deprecated)]
+        self.update_hash(index, crate::merkle_tree::leaf_hash(value), aux)
+    }
+
+    /// Inserts a value into a specific index of the tree.
+    pub fn try_update<T: BinaryHashRepr + ?Sized>(
         &self,
         index: u64,
         value: &T,
         aux: A,
-    ) -> Result<Self, InvalidUpdate>
-    where
-        Self: Sized,
-    {
-        self.update_hash(index, crate::merkle_tree::leaf_hash(value), aux)
+    ) -> Result<Self, InvalidUpdate> {
+        self.try_update_hash(index, crate::merkle_tree::leaf_hash(value), aux)
     }
 
     /// Collapses the tree between `start` and `end` (inclusive) into their
@@ -1333,7 +1384,7 @@ where
         let mut mt = MerkleTree::blank(height);
 
         for i in 0..height {
-            if let Ok(updated) = mt.update(i.into(), &rng.r#gen::<Fr>(), rng.r#gen()) {
+            if let Ok(updated) = mt.try_update(i.into(), &rng.r#gen::<Fr>(), rng.r#gen()) {
                 mt = updated;
             }
         }
@@ -1357,10 +1408,10 @@ mod tests {
     #[test]
     fn test_membership() {
         let tree = new_mt::<()>(32)
-            .update(0, &Fr::from(42u64), ())
-            .and_then(|mt| mt.update(0, &Fr::from(41u64), ()))
-            .and_then(|mt| mt.update(3, &Fr::from(43u64), ()))
-            .and_then(|mt| mt.update(62, &Fr::from(12u64), ()))
+            .try_update(0, &Fr::from(42u64), ())
+            .and_then(|mt| mt.try_update(0, &Fr::from(41u64), ()))
+            .and_then(|mt| mt.try_update(3, &Fr::from(43u64), ()))
+            .and_then(|mt| mt.try_update(62, &Fr::from(12u64), ()))
             .unwrap()
             .rehash();
         assert_eq!(
@@ -1380,10 +1431,10 @@ mod tests {
     #[test]
     fn test_collapse_good() {
         let tree = new_mt::<()>(32)
-            .update(0, &Fr::from(42u64), ())
-            .and_then(|mt| mt.update(0, &Fr::from(41u64), ()))
-            .and_then(|mt| mt.update(3, &Fr::from(43u64), ()))
-            .and_then(|mt| mt.update(62, &Fr::from(12u64), ()))
+            .try_update(0, &Fr::from(42u64), ())
+            .and_then(|mt| mt.try_update(0, &Fr::from(41u64), ()))
+            .and_then(|mt| mt.try_update(3, &Fr::from(43u64), ()))
+            .and_then(|mt| mt.try_update(62, &Fr::from(12u64), ()))
             .unwrap()
             .collapse(0, 61)
             .rehash();
@@ -1396,10 +1447,10 @@ mod tests {
     #[test]
     fn test_collapse_bad_proof() {
         let tree = new_mt::<()>(32)
-            .update(0, &Fr::from(42u64), ())
-            .and_then(|mt| mt.update(0, &Fr::from(41u64), ()))
-            .and_then(|mt| mt.update(3, &Fr::from(43u64), ()))
-            .and_then(|mt| mt.update(62, &Fr::from(12u64), ()))
+            .try_update(0, &Fr::from(42u64), ())
+            .and_then(|mt| mt.try_update(0, &Fr::from(41u64), ()))
+            .and_then(|mt| mt.try_update(3, &Fr::from(43u64), ()))
+            .and_then(|mt| mt.try_update(62, &Fr::from(12u64), ()))
             .unwrap()
             .collapse(0, 61)
             .rehash();
@@ -1409,39 +1460,39 @@ mod tests {
     #[test]
     fn test_collapse_bad_update() {
         let tree = new_mt::<()>(32)
-            .update(0, &Fr::from(42u64), ())
-            .and_then(|mt| mt.update(0, &Fr::from(41u64), ()))
-            .and_then(|mt| mt.update(3, &Fr::from(43u64), ()))
-            .and_then(|mt| mt.update(62, &Fr::from(12u64), ()))
+            .try_update(0, &Fr::from(42u64), ())
+            .and_then(|mt| mt.try_update(0, &Fr::from(41u64), ()))
+            .and_then(|mt| mt.try_update(3, &Fr::from(43u64), ()))
+            .and_then(|mt| mt.try_update(62, &Fr::from(12u64), ()))
             .unwrap()
             .collapse(0, 61)
-            .update(61, &Fr::from(0xdeadbeefu64), ());
+            .try_update(61, &Fr::from(0xdeadbeefu64), ());
         assert_eq!(tree, Err(InvalidUpdate::CollapsedIndex(1, 1)));
     }
 
     #[test]
     fn test_incremental_collapse() {
         let tree = new_mt::<()>(3)
-            .update(0, &Fr::from(42u64), ())
+            .try_update(0, &Fr::from(42u64), ())
             .unwrap()
             .collapse(0, 0)
-            .update(1, &Fr::from(42u64), ())
+            .try_update(1, &Fr::from(42u64), ())
             .unwrap()
             .collapse(1, 1)
-            .update(2, &Fr::from(42u64), ())
+            .try_update(2, &Fr::from(42u64), ())
             .unwrap()
             .collapse(2, 2)
-            .update(3, &Fr::from(42u64), ())
+            .try_update(3, &Fr::from(42u64), ())
             .unwrap()
-            .update(4, &Fr::from(42u64), ())
+            .try_update(4, &Fr::from(42u64), ())
             .unwrap()
             .collapse(4, 4);
         let tree2 = new_mt::<()>(3)
-            .update(0, &Fr::from(42u64), ())
-            .and_then(|mt| mt.update(1, &Fr::from(42u64), ()))
-            .and_then(|mt| mt.update(2, &Fr::from(42u64), ()))
-            .and_then(|mt| mt.update(3, &Fr::from(42u64), ()))
-            .and_then(|mt| mt.update(4, &Fr::from(42u64), ()))
+            .try_update(0, &Fr::from(42u64), ())
+            .and_then(|mt| mt.try_update(1, &Fr::from(42u64), ()))
+            .and_then(|mt| mt.try_update(2, &Fr::from(42u64), ()))
+            .and_then(|mt| mt.try_update(3, &Fr::from(42u64), ()))
+            .and_then(|mt| mt.try_update(4, &Fr::from(42u64), ()))
             .unwrap()
             .collapse(0, 2)
             .collapse(4, 4);
@@ -1451,16 +1502,18 @@ mod tests {
     #[test]
     fn test_collapsed_update() {
         let t = new_mt::<()>(6)
-            .update(0, &Fr::from(42u64), ())
+            .try_update(0, &Fr::from(42u64), ())
             .unwrap()
-            .update(1, &Fr::from(42u64), ())
+            .try_update(1, &Fr::from(42u64), ())
             .unwrap();
         let t2 = (2..=32)
-            .fold(t.clone(), |t, i| t.update(i, &Fr::from(42u64), ()).unwrap())
+            .fold(t.clone(), |t, i| {
+                t.try_update(i, &Fr::from(42u64), ()).unwrap()
+            })
             .rehash();
         let upd1 = MerkleTreeCollapsedUpdate::new(&t2, 2, 2).unwrap();
         let upd2 = MerkleTreeCollapsedUpdate::new(&t2, 3, 31).unwrap();
-        let t3 = t.update(32, &Fr::from(42u64), ()).unwrap();
+        let t3 = t.try_update(32, &Fr::from(42u64), ()).unwrap();
         let t4 = t3
             .apply_collapsed_update(&upd1)
             .unwrap()
@@ -1474,10 +1527,10 @@ mod tests {
     fn test_insertion_evidence() {
         let t = (0..=32)
             .fold(new_mt::<()>(6), |t, i| {
-                t.update(i, &Fr::from(42u64), ()).unwrap()
+                t.try_update(i, &Fr::from(42u64), ()).unwrap()
             })
             .rehash();
-        let t2 = t.update(12, &Fr::from(43u64), ()).unwrap().rehash();
+        let t2 = t.try_update(12, &Fr::from(43u64), ()).unwrap().rehash();
         let evidence = t2.insertion_evidence(12).unwrap();
         assert_eq!(
             t.update_from_evidence(evidence.clone()).unwrap().rehash(),
@@ -1493,8 +1546,8 @@ mod tests {
         );
         // test *not* rehashing the tree first
         let t3 = (33..=64).fold(
-            t.update(12, &Fr::from(43u64), ()).unwrap().rehash(),
-            |t, i| t.update(i, &Fr::from(42u64), ()).unwrap(),
+            t.try_update(12, &Fr::from(43u64), ()).unwrap().rehash(),
+            |t, i| t.try_update(i, &Fr::from(42u64), ()).unwrap(),
         );
         let evidence = t3.insertion_evidence(12).unwrap();
         dbg!(&evidence);
@@ -1512,7 +1565,7 @@ mod tests {
     #[test]
     fn test_singleton_collapsed_update() {
         let t = new_mt::<()>(6)
-            .update(0, &Fr::from(42u64), ())
+            .try_update(0, &Fr::from(42u64), ())
             .unwrap()
             .rehash();
         let upd = MerkleTreeCollapsedUpdate::new(&t, 0, 0).unwrap();
@@ -1526,18 +1579,20 @@ mod tests {
     #[test]
     fn test_tiny_trees() {
         let t = new_mt::<()>(1)
-            .update(0, &Fr::from(42u64), ())
+            .try_update(0, &Fr::from(42u64), ())
             .unwrap()
-            .update(1, &Fr::from(42u64), ())
+            .try_update(1, &Fr::from(42u64), ())
             .unwrap();
         t.path_for_leaf(0, Fr::from(42u64)).unwrap();
-        let t = new_mt::<()>(0).update(0, &Fr::from(42u64), ()).unwrap();
+        let t = new_mt::<()>(0).try_update(0, &Fr::from(42u64), ()).unwrap();
         t.path_for_leaf(0, Fr::from(42u64)).unwrap();
     }
 
     #[test]
     fn test_aux_data() {
-        let t = new_mt::<u8>(32).update(0, &Fr::from(42u64), 10).unwrap();
+        let t = new_mt::<u8>(32)
+            .try_update(0, &Fr::from(42u64), 10)
+            .unwrap();
         for (_index, (_hash, aux)) in t.iter_aux() {
             assert_eq!(aux, 10);
         }
@@ -1546,9 +1601,9 @@ mod tests {
     #[test]
     fn test_find_path_for_leaf_within_range() {
         let tree = new_mt::<()>(32)
-            .update(0, &Fr::from(10u64), ())
-            .and_then(|mt| mt.update(5, &Fr::from(20u64), ()))
-            .and_then(|mt| mt.update(10, &Fr::from(30u64), ()))
+            .try_update(0, &Fr::from(10u64), ())
+            .and_then(|mt| mt.try_update(5, &Fr::from(20u64), ()))
+            .and_then(|mt| mt.try_update(10, &Fr::from(30u64), ()))
             .unwrap()
             .rehash();
 
@@ -1584,8 +1639,8 @@ mod tests {
     #[test]
     fn test_find_path_for_hashed_leaf_within_range() {
         let tree = new_mt::<()>(32)
-            .update(0, &Fr::from(10u64), ())
-            .and_then(|mt| mt.update(5, &Fr::from(20u64), ()))
+            .try_update(0, &Fr::from(10u64), ())
+            .and_then(|mt| mt.try_update(5, &Fr::from(20u64), ()))
             .unwrap()
             .rehash();
 
@@ -1611,9 +1666,9 @@ mod tests {
     #[test]
     fn test_find_within_range_with_collapsed() {
         let tree = new_mt::<()>(6)
-            .update(0, &Fr::from(10u64), ())
-            .and_then(|mt| mt.update(5, &Fr::from(20u64), ()))
-            .and_then(|mt| mt.update(10, &Fr::from(30u64), ()))
+            .try_update(0, &Fr::from(10u64), ())
+            .and_then(|mt| mt.try_update(5, &Fr::from(20u64), ()))
+            .and_then(|mt| mt.try_update(10, &Fr::from(30u64), ()))
             .unwrap()
             .collapse(0, 4)
             .rehash();
@@ -1641,9 +1696,9 @@ mod tests {
     fn test_find_within_range_duplicate_leaves() {
         let val = Fr::from(42u64);
         let tree = new_mt::<()>(6)
-            .update(2, &val, ())
-            .and_then(|mt| mt.update(5, &val, ()))
-            .and_then(|mt| mt.update(8, &val, ()))
+            .try_update(2, &val, ())
+            .and_then(|mt| mt.try_update(5, &val, ()))
+            .and_then(|mt| mt.try_update(8, &val, ()))
             .unwrap()
             .rehash();
 

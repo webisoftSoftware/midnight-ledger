@@ -12,6 +12,7 @@
 // limitations under the License.
 
 use crate::conversions::*;
+use crate::events::Event;
 use crate::state_changes::DustStateChanges;
 use base_crypto::signatures;
 use base_crypto::signatures::Signature;
@@ -26,11 +27,10 @@ use ledger::dust::{
     DustUtxoState as LedgerDustUtxoState, InitialNonce,
     WithDustStateChanges as LedgerWithDustStateChanges,
 };
-use ledger::events::Event as LedgerEvent;
 use ledger::structure::{ProofMarker, ProofPreimageMarker, UtxoMeta as LedgerUtxoMeta};
 use onchain_runtime_wasm::{from_value_hex_ser, from_value_ser, to_value_hex_ser};
 use rand::rngs::OsRng;
-use serialize::tagged_serialize;
+use serialize::{tagged_deserialize_sequence, tagged_serialize};
 use std::cell::RefCell;
 use std::ops::Deref;
 use std::rc::Rc;
@@ -39,45 +39,6 @@ use storage::db::InMemoryDB;
 use transient_crypto::merkle_tree;
 use wasm_bindgen::JsError;
 use wasm_bindgen::prelude::*;
-
-#[wasm_bindgen]
-#[derive(Debug)]
-pub struct Event(pub(crate) LedgerEvent<InMemoryDB>);
-
-impl From<LedgerEvent<InMemoryDB>> for Event {
-    fn from(inner: LedgerEvent<InMemoryDB>) -> Event {
-        Event(inner)
-    }
-}
-
-#[wasm_bindgen]
-impl Event {
-    #[wasm_bindgen(constructor)]
-    pub fn new() -> Result<Event, JsError> {
-        Err(JsError::new(
-            "Event cannot be constructed directly through the WASM API.",
-        ))
-    }
-
-    pub fn serialize(&self) -> Result<Uint8Array, JsError> {
-        let mut res = Vec::new();
-        tagged_serialize(&self.0, &mut res)?;
-        Ok(Uint8Array::from(&res[..]))
-    }
-
-    pub fn deserialize(raw: Uint8Array) -> Result<Event, JsError> {
-        Ok(Event(from_value_ser(raw, "Event")?))
-    }
-
-    #[wasm_bindgen(js_name = "toString")]
-    pub fn to_string(&self, compact: Option<bool>) -> String {
-        if compact.unwrap_or(false) {
-            format!("{:?}", &self.0)
-        } else {
-            format!("{:#?}", &self.0)
-        }
-    }
-}
 
 #[derive(Clone)]
 pub enum DustSpendTypes {
@@ -1298,6 +1259,15 @@ impl DustLocalState {
         DustLocalState(LedgerDustLocalState::new(params.0))
     }
 
+    /// Set firstFree counters for both trees. Used after loading a collapsed state
+    /// whose serialized form has firstFree=0 but represents a state at a known tip.
+    #[wasm_bindgen(js_name = "setFirstFree")]
+    pub fn set_first_free(mut self, commitment_first_free: u64, generation_first_free: u64) -> DustLocalState {
+        self.0.commitment_tree_first_free = commitment_first_free;
+        self.0.generating_tree_first_free = generation_first_free;
+        self
+    }
+
     #[wasm_bindgen(js_name = "walletBalance")]
     pub fn wallet_balance(&self, time: &Date) -> BigInt {
         let time = Timestamp::from_secs(js_date_to_seconds(time));
@@ -1485,52 +1455,89 @@ impl DustLocalState {
         Ok(DustLocalState(self.0.replay_events(&sk, events)?))
     }
 
-    /// Parses a MNCX .bin container and replays all dust events with full
-    /// processing.  All heavy lifting in WASM — no JS boundary crossings.
-    #[wasm_bindgen(js_name = "replayEventsFromBin")]
-    pub fn replay_events_from_bin(
-        &self,
+    /// Expands collapsed merkle paths in both dust trees (generation + commitment)
+    /// from serialized insertion evidence returned by the server.
+    /// Each evidence buffer is concatenated tagged-serialized TreeInsertionPath blobs.
+    #[wasm_bindgen(js_name = "expandFromEvidence")]
+    pub fn expand_from_evidence(
+        mut self,
+        gen_evidence: &[u8],
+        com_evidence: &[u8],
+    ) -> Result<DustLocalState, JsError> {
+        use transient_crypto::merkle_tree::TreeInsertionPath;
+
+        let gen_paths: Vec<TreeInsertionPath<ledger::dust::DustGenerationInfo>> =
+            serialize::tagged_deserialize_sequence(gen_evidence)
+                .map_err(|e| JsError::new(&format!("invalid generation evidence: {e}")))?;
+        for (count, path) in gen_paths.into_iter().enumerate() {
+            self.0.generating_tree = self.0.generating_tree
+                .update_from_evidence(path)
+                .map_err(|e| JsError::new(&format!("expand generation path {count} failed: {e:?}")))?;
+        }
+
+        let com_paths: Vec<TreeInsertionPath<()>> =
+            serialize::tagged_deserialize_sequence(com_evidence)
+                .map_err(|e| JsError::new(&format!("invalid commitment evidence: {e}")))?;
+        for (count, path) in com_paths.into_iter().enumerate() {
+            self.0.commitment_tree = self.0.commitment_tree
+                .update_from_evidence(path)
+                .map_err(|e| JsError::new(&format!("expand commitment path {count} failed: {e:?}")))?;
+        }
+
+        Ok(self)
+    }
+    /// Inserts a found dust UTXO into the state. Computes nullifier from secret key.
+    /// `output_bytes` must be tagged-serialized (`midnight:qualified-dust-output[v1]:...`).
+    /// Used by main thread to merge viewing-key worker results.
+    #[wasm_bindgen(js_name = "insertFoundDustUtxo")]
+    pub fn insert_found_dust_utxo(
+        self,
         sk: &DustSecretKey,
-        bin_data: &[u8],
-    ) -> Result<DustBinReplayResult, JsError> {
-        use serialize::tagged_deserialize;
-
+        output_bytes: &[u8],
+        generation_index: u64,
+    ) -> Result<DustLocalState, JsError> {
         let sk_inner = sk.try_unwrap()?;
+        let output: ledger::dust::QualifiedDustOutput = serialize::tagged_deserialize(output_bytes)
+            .map_err(|e| JsError::new(&format!("invalid dust output: {e}")))?;
+        Ok(DustLocalState(self.0.insert_found_utxo(&sk_inner, output, generation_index)))
+    }
 
-        const HEADER_SIZE: usize = 21;
-        const RECORD_HEADER_SIZE: usize = 12;
+    /// Batch insert: takes the raw UTXO section of the dust-import response.
+    /// Format per UTXO: [4B outputLen][tagged outputBytes][4B genInfoLen][tagged genInfoBytes][8B generationIndex]
+    /// All embedded blobs use tagged serialization (consistent with the rest of the SDK).
+    /// Single WASM call instead of N boundary crossings.
+    #[wasm_bindgen(js_name = "insertFoundDustUtxosBatch")]
+    pub fn insert_found_dust_utxos_batch(
+        mut self,
+        sk: &DustSecretKey,
+        raw: &[u8],
+    ) -> Result<DustLocalState, JsError> {
+        let sk_inner = sk.try_unwrap()?;
+        let mut cursor = raw;
+        let mut count = 0u32;
+        while cursor.len() >= 4 {
+            let output_len = u32::from_le_bytes(cursor[..4].try_into().map_err(|_| JsError::new("truncated output_len"))?) as usize;
+            cursor = &cursor[4..];
+            if cursor.len() < output_len { break; }
+            let output_bytes = &cursor[..output_len];
+            cursor = &cursor[output_len..];
 
-        if bin_data.len() < HEADER_SIZE || &bin_data[0..4] != b"MNCX" {
-            return Err(JsError::new("Invalid MNCX container"));
+            if cursor.len() < 4 { break; }
+            let gen_info_len = u32::from_le_bytes(cursor[..4].try_into().map_err(|_| JsError::new("truncated gen_info_len"))?) as usize;
+            cursor = &cursor[4..];
+            if cursor.len() < gen_info_len { break; }
+            cursor = &cursor[gen_info_len..];
+
+            if cursor.len() < 8 { break; }
+            let generation_index = u64::from_le_bytes(cursor[..8].try_into().map_err(|_| JsError::new("truncated generation_index"))?) ;
+            cursor = &cursor[8..];
+
+            let output: ledger::dust::QualifiedDustOutput = serialize::tagged_deserialize(output_bytes)
+                .map_err(|e| JsError::new(&format!("invalid dust output at index {count}: {e}")))?;
+            self.0 = self.0.insert_found_utxo(&sk_inner, output, generation_index);
+            count += 1;
         }
-        let last_event_id = u64::from_le_bytes(bin_data[5..13].try_into().unwrap());
-        let event_count = u64::from_le_bytes(bin_data[13..21].try_into().unwrap());
-
-        let mut events: Vec<LedgerEvent<InMemoryDB>> = Vec::with_capacity(event_count as usize);
-        let mut offset = HEADER_SIZE;
-        while offset + RECORD_HEADER_SIZE <= bin_data.len() {
-            let payload_len = u32::from_le_bytes(
-                bin_data[offset + 8..offset + 12].try_into().unwrap(),
-            ) as usize;
-            let payload_start = offset + RECORD_HEADER_SIZE;
-            let payload_end = payload_start + payload_len;
-            if payload_end > bin_data.len() {
-                return Err(JsError::new("MNCX record exceeds bounds"));
-            }
-            let event: LedgerEvent<InMemoryDB> =
-                tagged_deserialize(&mut &bin_data[payload_start..payload_end])
-                    .map_err(|e| JsError::new(&format!("Dust event deserialize: {e}")))?;
-            events.push(event);
-            offset = payload_end;
-        }
-
-        let event_refs = events.iter().map(|e| e);
-        let new_state = self.0.replay_events(&sk_inner, event_refs)?;
-        Ok(DustBinReplayResult {
-            state: DustLocalState(new_state),
-            last_event_id,
-            event_count,
-        })
+        Ok(self)
     }
 
     #[wasm_bindgen(js_name = "replayEventsWithChanges")]
@@ -1542,6 +1549,18 @@ impl DustLocalState {
         let sk = sk.try_unwrap()?;
         let events = events.iter().map(|event| &event.0);
         let with_changes = self.0.replay_events_with_changes(&sk, events)?;
+        Ok(DustLocalStateWithChanges::from(with_changes))
+    }
+
+    #[wasm_bindgen(js_name = "replayRawEvents")]
+    pub fn replay_raw_events(
+        &self,
+        sk: &DustSecretKey,
+        raw_events: &[u8],
+    ) -> Result<DustLocalStateWithChanges, JsError> {
+        let sk = sk.try_unwrap()?;
+        let events = tagged_deserialize_sequence(raw_events)?;
+        let with_changes = self.0.replay_events_with_changes(&sk, events.iter())?;
         Ok(DustLocalStateWithChanges::from(with_changes))
     }
 
@@ -1752,31 +1771,5 @@ impl DustStateMerkleTreeCollapsedUpdate {
         } else {
             format!("{:#?}", &self.0)
         }
-    }
-}
-
-/// Result of replaying dust events from a MNCX .bin container.
-#[wasm_bindgen]
-pub struct DustBinReplayResult {
-    state: DustLocalState,
-    last_event_id: u64,
-    event_count: u64,
-}
-
-#[wasm_bindgen]
-impl DustBinReplayResult {
-    #[wasm_bindgen(getter)]
-    pub fn state(&self) -> DustLocalState {
-        self.state.clone()
-    }
-
-    #[wasm_bindgen(getter, js_name = "lastEventId")]
-    pub fn last_event_id(&self) -> u64 {
-        self.last_event_id
-    }
-
-    #[wasm_bindgen(getter, js_name = "eventCount")]
-    pub fn event_count(&self) -> u64 {
-        self.event_count
     }
 }

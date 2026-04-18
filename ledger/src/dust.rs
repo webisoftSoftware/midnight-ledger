@@ -965,7 +965,7 @@ impl<D: DB> DustState<D> {
         state.utxo.commitments = state
             .utxo
             .commitments
-            .update_hash(
+            .try_update_hash(
                 self.utxo.commitments_first_free,
                 spend.new_commitment.into(),
                 (),
@@ -1097,7 +1097,7 @@ impl<D: DB> DustState<D> {
         state.utxo.commitments = state
             .utxo
             .commitments
-            .update_hash(
+            .try_update_hash(
                 state.utxo.commitments_first_free,
                 dust_commitment.into(),
                 (),
@@ -1118,7 +1118,7 @@ impl<D: DB> DustState<D> {
         state.generation.generating_tree = state
             .generation
             .generating_tree
-            .update_hash(
+            .try_update_hash(
                 state.generation.generating_tree_first_free,
                 gen_info.merkle_hash(),
                 gen_info,
@@ -1220,7 +1220,7 @@ impl<D: DB> DustState<D> {
             state.generation.generating_tree = state
                 .generation
                 .generating_tree
-                .update_hash(*idx, gen_info.merkle_hash(), gen_info)
+                .try_update_hash(*idx, gen_info.merkle_hash(), gen_info)
                 .map_err(TransactionInvalid::MerkleTreeError)?
                 .rehash();
             event_push(EventDetails::DustGenerationDtimeUpdate {
@@ -1346,9 +1346,9 @@ impl Error for DustSpendError {}
 #[tag = "dust-local-state[v1]"]
 pub struct DustLocalState<D: DB> {
     pub generating_tree: MerkleTree<DustGenerationInfo, D>,
-    generating_tree_first_free: u64,
+    pub generating_tree_first_free: u64,
     pub commitment_tree: MerkleTree<(), D>,
-    commitment_tree_first_free: u64,
+    pub commitment_tree_first_free: u64,
     night_indices: HashMap<InitialNonce, u64, D>,
     dust_utxos: HashMap<DustNullifier, DustWalletUtxoState, D>,
     pub sync_time: Timestamp,
@@ -1544,7 +1544,7 @@ impl<D: DB> DustLocalState<D> {
 
         state.generating_tree = state
             .generating_tree
-            .update_hash(generation_index, gen_info.merkle_hash(), gen_info)
+            .try_update_hash(generation_index, gen_info.merkle_hash(), gen_info)
             .map_err(DustLocalStateError::MerkleTreeError)?;
         state.generating_tree_first_free += 1;
         if let Some(initial_nonce) = initial_nonce {
@@ -1627,7 +1627,7 @@ impl<D: DB> DustLocalState<D> {
 
         state.commitment_tree = state
             .commitment_tree
-            .update_hash(commitment_index, qdo.commitment().into(), ())
+            .try_update_hash(commitment_index, qdo.commitment().into(), ())
             .map_err(DustLocalStateError::MerkleTreeError)?;
         state.commitment_tree_first_free += 1;
         if !own_qdo {
@@ -1887,7 +1887,11 @@ impl<D: DB> DustLocalState<D> {
                         acc.result.generating_tree = acc
                             .result
                             .generating_tree
-                            .update_hash(*generation_index, generation.merkle_hash(), *generation)
+                            .try_update_hash(
+                                *generation_index,
+                                generation.merkle_hash(),
+                                *generation,
+                            )
                             .map_err(EventReplayError::MerkleTreeError)?;
                         acc.result.generating_tree_first_free += 1;
                         if output.mt_index != acc.result.commitment_tree_first_free {
@@ -1900,7 +1904,7 @@ impl<D: DB> DustLocalState<D> {
                         acc.result.commitment_tree = acc
                             .result
                             .commitment_tree
-                            .update_hash(output.mt_index, output.commitment().into(), ())
+                            .try_update_hash(output.mt_index, output.commitment().into(), ())
                             .map_err(EventReplayError::MerkleTreeError)?;
                         acc.result.commitment_tree_first_free += 1;
                         let maybe_change = if pk == output.owner {
@@ -1963,7 +1967,7 @@ impl<D: DB> DustLocalState<D> {
                         acc.result.commitment_tree = acc
                             .result
                             .commitment_tree
-                            .update_hash(*commitment_index, (*commitment).into(), ())
+                            .try_update_hash(*commitment_index, (*commitment).into(), ())
                             .map_err(EventReplayError::MerkleTreeError)?;
                         acc.result.commitment_tree_first_free += 1;
                         let maybe_change = if let Some(utxo) = acc.result.dust_utxos.get(nullifier)
@@ -2052,6 +2056,23 @@ impl<D: DB> DustLocalState<D> {
         res.result.commitment_tree = res.result.commitment_tree.rehash();
         res.result.generating_tree = res.result.generating_tree.rehash();
         Ok(res)
+    }
+
+    /// Inserts a found dust UTXO into the wallet state.
+    /// Computes the nullifier from the secret key and registers the UTXO.
+    /// Used by main thread to merge viewing-key worker scan results.
+    pub fn insert_found_utxo(
+        mut self,
+        sk: &DustSecretKey,
+        output: QualifiedDustOutput,
+        generation_index: u64,
+    ) -> Self {
+        self.night_indices = self.night_indices.insert(output.backing_night, generation_index);
+        self.dust_utxos = self.dust_utxos.insert(
+            output.nullifier(sk),
+            DustWalletUtxoState { utxo: output, pending_until: None },
+        );
+        self
     }
 }
 

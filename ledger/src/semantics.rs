@@ -147,13 +147,21 @@ pub trait ZswapLocalStateExt<D: DB>: Sized {
     ) -> Result<WithZswapStateChanges<Self>, EventReplayError>;
     /// Replays events updating only the Merkle tree structure (commitments +
     /// collapse) without performing trial decryption.  No coins are discovered.
-    /// This is O(n) tree insertions + a single rehash — no elliptic curve
-    /// operations.
+    /// Used by the backend for server-side tree building.
     #[must_use = "return value must be used"]
     fn replay_events_tree_only<'a>(
         &self,
         events: impl IntoIterator<Item = &'a Event<D>>,
     ) -> Result<Self, EventReplayError>;
+
+    /// Scans events for coins WITHOUT modifying the Merkle tree, and produces
+    /// `ZswapStateChanges` (received/spent per tx) for transaction history.
+    #[must_use = "return value must be used"]
+    fn scan_coins_with_changes<'a>(
+        self,
+        secret_keys: &SecretKeys,
+        events: impl IntoIterator<Item = &'a Event<D>>,
+    ) -> Result<WithZswapStateChanges<Self>, EventReplayError>;
 }
 
 impl<D: DB> ZswapLocalStateExt<D> for ZswapLocalState<D> {
@@ -303,7 +311,7 @@ impl<D: DB> ZswapLocalStateExt<D> for ZswapLocalState<D> {
                     acc.result.merkle_tree =
                         acc.result
                             .merkle_tree
-                            .update_hash(*mt_index, commitment.0, ())?;
+                            .try_update_hash(*mt_index, commitment.0, ())?;
                     acc.result.first_free += 1;
                     let maybe_change = if let Some(ci) = acc.result.pending_outputs.get(commitment)
                     {
@@ -363,13 +371,12 @@ impl<D: DB> ZswapLocalStateExt<D> for ZswapLocalState<D> {
                             tree_name: "zswap commitment",
                         });
                     }
-                    acc.merkle_tree =
-                        acc.merkle_tree.update_hash(*mt_index, commitment.0, ())?;
+                    acc.merkle_tree = acc
+                        .merkle_tree
+                        .try_update_hash(*mt_index, commitment.0, ())?;
                     acc.first_free += 1;
-                    // No trial decryption — collapse immediately
                     acc.merkle_tree = acc.merkle_tree.collapse(*mt_index, *mt_index);
                 }
-                // ZswapInput: no tree changes needed, skip
                 _ => {}
             }
             Ok(acc)
@@ -377,6 +384,73 @@ impl<D: DB> ZswapLocalStateExt<D> for ZswapLocalState<D> {
         res.merkle_tree = res.merkle_tree.rehash();
         Ok(res)
     }
+
+    fn scan_coins_with_changes<'a>(
+        mut self,
+        secret_keys: &SecretKeys,
+        events: impl IntoIterator<Item = &'a Event<D>>,
+    ) -> Result<WithZswapStateChanges<Self>, EventReplayError> {
+        use coin_structure::transfer::SenderEvidence;
+
+        let sender_evidence = SenderEvidence::User(Cow::Borrowed(&secret_keys.coin_secret_key));
+        let mut acc = WithZswapStateChanges::new(());
+
+        for event in events {
+            match &event.content {
+                EventDetails::ZswapInput {
+                    nullifier,
+                    contract: None,
+                } => {
+                    let maybe_change = self.coins.get(nullifier).map(|qci| ZswapStateChanges {
+                        received_coins: vec![],
+                        spent_coins: vec![*qci],
+                        source: event.source.transaction_hash,
+                    });
+                    self.coins = self.coins.remove(nullifier);
+                    self.pending_spends = self.pending_spends.remove(nullifier);
+                    acc = acc.maybe_add_change(maybe_change);
+                }
+                EventDetails::ZswapOutput {
+                    commitment,
+                    preimage_evidence,
+                    mt_index,
+                    ..
+                } => {
+                    let maybe_change =
+                        if let Some(ci) = self.pending_outputs.get(commitment).copied() {
+                            let qci = ci.qualify(*mt_index);
+                            self.pending_outputs = self.pending_outputs.remove(commitment);
+                            self.coins =
+                                self.coins.insert(ci.nullifier(&sender_evidence), qci);
+                            Some(ZswapStateChanges {
+                                received_coins: vec![qci],
+                                spent_coins: vec![],
+                                source: event.source.transaction_hash,
+                            })
+                        } else if let Some(ci) = preimage_evidence.try_with_keys(secret_keys) {
+                            let qci = ci.qualify(*mt_index);
+                            self.coins =
+                                self.coins.insert(ci.nullifier(&sender_evidence), qci);
+                            Some(ZswapStateChanges {
+                                received_coins: vec![qci],
+                                spent_coins: vec![],
+                                source: event.source.transaction_hash,
+                            })
+                        } else {
+                            None
+                        };
+                    acc = acc.maybe_add_change(maybe_change);
+                }
+                _ => {}
+            }
+        }
+
+        Ok(WithZswapStateChanges {
+            changes: acc.changes,
+            result: self,
+        })
+    }
+
 }
 
 type ApplySectionResult<D> = (LedgerState<D>, Vec<Event<D>>);
@@ -469,7 +543,7 @@ impl<D: DB> LedgerState<D> {
                 coin_coms: self
                     .zswap
                     .coin_coms
-                    .update(self.zswap.first_free, &cm, None)
+                    .try_update(self.zswap.first_free, &cm, None)
                     .map_err(SystemTransactionError::MerkleTreeError)?,
                 coin_coms_set: self.zswap.coin_coms_set.insert(cm, ()),
                 first_free: self.zswap.first_free + 1,
@@ -903,7 +977,7 @@ impl<D: DB> LedgerState<D> {
                             dust_state.generation.generating_tree = dust_state
                                 .generation
                                 .generating_tree
-                                .update_hash(*idx, gen_info.merkle_hash(), gen_info)
+                                .try_update_hash(*idx, gen_info.merkle_hash(), gen_info)
                                 .map_err(SystemTransactionError::MerkleTreeError)?
                                 .rehash();
                             event_push(EventDetails::DustGenerationDtimeUpdate {
