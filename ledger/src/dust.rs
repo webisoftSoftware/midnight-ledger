@@ -1559,32 +1559,6 @@ impl<D: DB> DustLocalState<D> {
         Ok(state)
     }
 
-    /// Inserts a found dust UTXO from fast-sync evidence into the wallet state.
-    /// Skips commitment tree insert if the position is Collapsed (the collapsed
-    /// update already has the correct hash). Only used by fast-sync WASM bindings,
-    /// never by WebSocket replay.
-    pub fn insert_found_utxo(
-        &self,
-        sk: &DustSecretKey,
-        qdo: QualifiedDustOutput,
-        generation_index: u64,
-    ) -> Self {
-        let nullifier = qdo.nullifier(sk);
-        let com = HashOutput::from(qdo.commitment());
-        let mut res = self.clone();
-        // Skip commitment tree insert if position is Collapsed — the collapsed
-        // update already has the correct hash at that position.
-        if let Ok(updated) = res.commitment_tree.try_update_hash(qdo.mt_index, com, ()) {
-            res.commitment_tree = updated;
-        }
-        res.dust_utxos = res.dust_utxos.insert(
-            nullifier,
-            DustWalletUtxoState { utxo: qdo, pending_until: None },
-        );
-        res.night_indices = res.night_indices.insert(qdo.backing_night, generation_index);
-        res
-    }
-
     pub fn remove_generation_info(
         &self,
         generation_index: u64,

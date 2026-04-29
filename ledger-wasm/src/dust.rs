@@ -1582,151 +1582,128 @@ impl DustLocalState {
         self
     }
 
-    /// Expands collapsed merkle paths in both dust trees from serialized evidence.
-    #[wasm_bindgen(js_name = "expandFromEvidence")]
-    pub fn expand_from_evidence(
-        mut self,
-        gen_evidence: &[u8],
-        com_evidence: &[u8],
-    ) -> Result<DustLocalState, JsError> {
-        use transient_crypto::merkle_tree::TreeInsertionPath;
-
-        let gen_paths: Vec<TreeInsertionPath<ledger::dust::DustGenerationInfo>> =
-            serialize::tagged_deserialize_sequence(gen_evidence)
-                .map_err(|e| JsError::new(&format!("invalid generation evidence: {e}")))?;
-        for (count, path) in gen_paths.into_iter().enumerate() {
-            self.0.generating_tree = self.0.generating_tree
-                .update_from_evidence(path)
-                .map_err(|e| JsError::new(&format!("expand generation path {count} failed: {e:?}")))?;
-        }
-
-        let com_paths: Vec<TreeInsertionPath<()>> =
-            serialize::tagged_deserialize_sequence(com_evidence)
-                .map_err(|e| JsError::new(&format!("invalid commitment evidence: {e}")))?;
-        for (count, path) in com_paths.into_iter().enumerate() {
-            self.0.commitment_tree = self.0.commitment_tree
-                .update_from_evidence(path)
-                .map_err(|e| JsError::new(&format!("expand commitment path {count} failed: {e:?}")))?;
-        }
-
-        self.0.generating_tree = self.0.generating_tree.rehash();
-        self.0.commitment_tree = self.0.commitment_tree.rehash();
-        Ok(self)
-    }
-
-    /// Expands evidence paths into real Leaf nodes that support index() and spending.
-    /// Uses uncollapse_from_expansion on MerkleTree with **sibling** hashes —
-    /// splits Collapsed nodes along evidence paths, creating Leaf nodes at UTXO
-    /// positions with correctly-hashed siblings. Only called from fast sync.
+    /// Applies a v2 interleaved dust import response using stock SDK methods.
+    /// No evidence expansion — collapsed updates skip wallet leaf positions,
+    /// and wallet leaves are inserted via standard insertGenerationInfo/addUtxo.
     ///
-    /// NOTE: Requires the server to send `TreeExpansionPath` (sibling hashes)
-    /// rather than `TreeInsertionPath` (path-node hashes).
-    #[wasm_bindgen(js_name = "expandFromEvidenceSafe")]
-    pub fn expand_from_evidence_safe(
+    /// Binary format:
+    /// Generation tree:
+    ///   [4B segment_count]
+    ///   For each segment:
+    ///     [4B collapsed_len][collapsed update bytes]
+    ///     [4B gen_info_len][tagged DustGenerationInfo]
+    ///     [8B generation_index]
+    ///   [4B trailing_collapsed_len][trailing collapsed update bytes]
+    ///
+    /// Commitment tree:
+    ///   [4B segment_count]
+    ///   For each segment:
+    ///     [4B collapsed_len][collapsed update bytes]
+    ///     [4B utxo_len][tagged QualifiedDustOutput]
+    ///     [8B commitment_mt_index]
+    ///   [4B trailing_collapsed_len][trailing collapsed update bytes]
+    ///
+    /// [8B lastEventId]
+    #[wasm_bindgen(js_name = "applyInterleavedDustV2")]
+    pub fn apply_interleaved_dust_v2(
         mut self,
-        gen_evidence: &[u8],
-        com_evidence: &[u8],
-    ) -> Result<DustLocalState, JsError> {
-        use transient_crypto::merkle_tree::TreeExpansionPath;
-
-        let gen_paths: Vec<TreeExpansionPath<ledger::dust::DustGenerationInfo>> =
-            serialize::tagged_deserialize_sequence(gen_evidence)
-                .map_err(|e| JsError::new(&format!("invalid generation expansion: {e}")))?;
-        for (count, path) in gen_paths.into_iter().enumerate() {
-            self.0.generating_tree = self.0.generating_tree
-                .uncollapse_from_expansion(path)
-                .map_err(|e| JsError::new(&format!("uncollapse gen path {count} failed: {e:?}")))?;
-        }
-
-        let com_paths: Vec<TreeExpansionPath<()>> =
-            serialize::tagged_deserialize_sequence(com_evidence)
-                .map_err(|e| JsError::new(&format!("invalid commitment expansion: {e}")))?;
-        for (count, path) in com_paths.into_iter().enumerate() {
-            self.0.commitment_tree = self.0.commitment_tree
-                .uncollapse_from_expansion(path)
-                .map_err(|e| JsError::new(&format!("uncollapse com path {count} failed: {e:?}")))?;
-        }
-
-        self.0.generating_tree = self.0.generating_tree.rehash();
-        self.0.commitment_tree = self.0.commitment_tree.rehash();
-        Ok(self)
-    }
-
-    /// Applies batch dtime (generation info) updates from raw binary.
-    #[wasm_bindgen(js_name = "applyDtimeUpdates")]
-    pub fn apply_dtime_updates(mut self, raw: &[u8]) -> Result<DustLocalState, JsError> {
-        let mut offset = 0usize;
-        if raw.len() < 4 { return Ok(self); }
-        let count = u32::from_le_bytes(raw[offset..offset+4].try_into().unwrap()) as usize;
-        offset += 4;
-        for i in 0..count {
-            if offset + 8 > raw.len() { break; }
-            let generation_index = u64::from_le_bytes(raw[offset..offset+8].try_into().unwrap());
-            offset += 8;
-            if offset + 4 > raw.len() { break; }
-            let gen_info_len = u32::from_le_bytes(raw[offset..offset+4].try_into().unwrap()) as usize;
-            offset += 4;
-            if offset + gen_info_len > raw.len() { break; }
-            let gen_info: ledger::dust::DustGenerationInfo = serialize::tagged_deserialize(&raw[offset..offset+gen_info_len])
-                .map_err(|e| JsError::new(&format!("dtime update {i}: invalid gen_info: {e}")))?;
-            offset += gen_info_len;
-            self.0.generating_tree = self.0.generating_tree
-                .try_update_hash(generation_index, gen_info.merkle_hash(), gen_info)
-                .map_err(|e| JsError::new(&format!("dtime update {i}: tree update failed at index {generation_index}: {e:?}")))?;
-        }
-        self.0.generating_tree = self.0.generating_tree.rehash();
-        Ok(self)
-    }
-
-    /// Inserts a found dust UTXO. Computes nullifier from secret key.
-    #[wasm_bindgen(js_name = "insertFoundDustUtxo")]
-    pub fn insert_found_dust_utxo(
-        self,
-        sk: &DustSecretKey,
-        output_bytes: &[u8],
-        generation_index: u64,
-    ) -> Result<DustLocalState, JsError> {
-        let sk_inner = sk.try_unwrap()?;
-        let output: ledger::dust::QualifiedDustOutput = serialize::tagged_deserialize(output_bytes)
-            .map_err(|e| JsError::new(&format!("invalid dust output: {e}")))?;
-        let mut state = self.0.insert_found_utxo(&sk_inner, output, generation_index);
-        state.commitment_tree = state.commitment_tree.rehash();
-        Ok(DustLocalState(state))
-    }
-
-    /// Batch insert found dust UTXOs from raw binary.
-    #[wasm_bindgen(js_name = "insertFoundDustUtxosBatch")]
-    pub fn insert_found_dust_utxos_batch(
-        mut self,
-        sk: &DustSecretKey,
         raw: &[u8],
+        sk: &DustSecretKey,
     ) -> Result<DustLocalState, JsError> {
         let sk_inner = sk.try_unwrap()?;
-        let mut cursor = raw;
-        let mut count = 0u32;
-        while cursor.len() >= 4 {
-            let output_len = u32::from_le_bytes(cursor[..4].try_into().map_err(|_| JsError::new("truncated output_len"))?) as usize;
-            cursor = &cursor[4..];
-            if cursor.len() < output_len { break; }
-            let output_bytes = &cursor[..output_len];
-            cursor = &cursor[output_len..];
+        let mut off = 0usize;
 
-            if cursor.len() < 4 { break; }
-            let gen_info_len = u32::from_le_bytes(cursor[..4].try_into().map_err(|_| JsError::new("truncated gen_info_len"))?) as usize;
-            cursor = &cursor[4..];
-            if cursor.len() < gen_info_len { break; }
-            cursor = &cursor[gen_info_len..];
-
-            if cursor.len() < 8 { break; }
-            let generation_index = u64::from_le_bytes(cursor[..8].try_into().map_err(|_| JsError::new("truncated generation_index"))?) ;
-            cursor = &cursor[8..];
-
-            let output: ledger::dust::QualifiedDustOutput = serialize::tagged_deserialize(output_bytes)
-                .map_err(|e| JsError::new(&format!("invalid dust output at index {count}: {e}")))?;
-            self.0 = self.0.insert_found_utxo(&sk_inner, output, generation_index);
-            count += 1;
+        macro_rules! read_u32 {
+            () => {{
+                if off + 4 > raw.len() { return Err(JsError::new("v2: truncated u32")); }
+                let v = u32::from_le_bytes(raw[off..off+4].try_into().unwrap());
+                off += 4;
+                v as usize
+            }};
         }
-        self.0.commitment_tree = self.0.commitment_tree.rehash();
+        macro_rules! read_u64 {
+            () => {{
+                if off + 8 > raw.len() { return Err(JsError::new("v2: truncated u64")); }
+                let v = u64::from_le_bytes(raw[off..off+8].try_into().unwrap());
+                off += 8;
+                v
+            }};
+        }
+        macro_rules! read_bytes {
+            ($n:expr) => {{
+                let n = $n;
+                if off + n > raw.len() { return Err(JsError::new("v2: truncated bytes")); }
+                let s = &raw[off..off+n];
+                off += n;
+                s
+            }};
+        }
+        macro_rules! apply_collapsed {
+            ($label:expr, $method:ident) => {{
+                let clen = read_u32!();
+                if clen > 0 {
+                    let cbytes = read_bytes!(clen);
+                    let update: merkle_tree::MerkleTreeCollapsedUpdate =
+                        serialize::tagged_deserialize(cbytes)
+                            .map_err(|e| JsError::new(&format!("v2 {} collapsed deser: {e}", $label)))?;
+                    self.0 = self.0.$method(&update)
+                        .map_err(|e| JsError::new(&format!("v2 {} collapsed apply: {e:?}", $label)))?;
+                }
+            }};
+        }
+
+        // === Generation tree ===
+        let gen_count = read_u32!();
+        for i in 0..gen_count {
+            apply_collapsed!(format!("gen[{i}]"), apply_generation_collapsed_update);
+
+            let gi_len = read_u32!();
+            let gi_bytes = read_bytes!(gi_len);
+            let gen_info: ledger::dust::DustGenerationInfo =
+                serialize::tagged_deserialize(gi_bytes)
+                    .map_err(|e| JsError::new(&format!("v2 gen_info[{i}] deser: {e}")))?;
+            let gen_idx = read_u64!();
+
+            // Debug: log merkle_hash for comparison with server
+            let mh = gen_info.merkle_hash();
+            let mh_hex: String = mh.0.iter().map(|b| format!("{:02x}", b)).collect();
+            let _ = js_sys::eval(&format!(
+                "console.log('[v2 WASM] gen[{}] idx={} merkle_hash={}')",
+                i, gen_idx, mh_hex
+            ));
+
+            let initial_nonce = Some(gen_info.nonce);
+            self.0 = self.0.insert_generation_info(gen_idx, gen_info, initial_nonce)
+                .map_err(|e| JsError::new(&format!("v2 gen insert[{i}] at {gen_idx}: {e:?}")))?;
+        }
+        // Trailing generation collapsed update
+        apply_collapsed!("gen[trailing]", apply_generation_collapsed_update);
+
+        // === Commitment tree ===
+        let com_count = read_u32!();
+        for i in 0..com_count {
+            apply_collapsed!(format!("com[{i}]"), apply_commitment_collapsed_update);
+
+            let utxo_len = read_u32!();
+            let utxo_bytes = read_bytes!(utxo_len);
+            let qdo: ledger::dust::QualifiedDustOutput =
+                serialize::tagged_deserialize(utxo_bytes)
+                    .map_err(|e| JsError::new(&format!("v2 utxo[{i}] deser: {e}")))?;
+            let com_idx = read_u64!();
+
+            // insertCommitment with own_qdo=true (our UTXO — don't collapse)
+            self.0 = self.0.insert_commitment(com_idx, qdo, true)
+                .map_err(|e| JsError::new(&format!("v2 com insert[{i}] at {com_idx}: {e:?}")))?;
+
+            // addUtxo to wallet's UTXO map
+            let nullifier = qdo.nullifier(&sk_inner);
+            self.0 = self.0.add_utxo(&nullifier, &qdo, None)
+                .map_err(|e| JsError::new(&format!("v2 add_utxo[{i}]: {e:?}")))?;
+        }
+        // Trailing commitment collapsed update
+        apply_collapsed!("com[trailing]", apply_commitment_collapsed_update);
+        let _ = off;
+
         Ok(self)
     }
 }
