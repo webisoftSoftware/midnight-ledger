@@ -1614,6 +1614,57 @@ impl DustLocalState {
         Ok(self)
     }
 
+    /// Like expandFromEvidence but uses try_update_hash to create real Leaf nodes
+    /// instead of keeping Collapsed nodes. This allows index() and spending to work.
+    /// Does NOT touch upstream merkle_tree.rs code.
+    #[wasm_bindgen(js_name = "expandFromEvidenceSafe")]
+    pub fn expand_from_evidence_safe(
+        mut self,
+        gen_evidence: &[u8],
+        com_evidence: &[u8],
+    ) -> Result<DustLocalState, JsError> {
+        use transient_crypto::merkle_tree::TreeInsertionPath;
+
+        // Compute leaf index from path directions (goes_left = 0 bit, goes_right = 1 bit)
+        fn path_to_index(path: &[transient_crypto::merkle_tree::TreeInsertionPathEntry]) -> u64 {
+            let mut index = 0u64;
+            for (level, entry) in path.iter().enumerate() {
+                if !entry.goes_left {
+                    index |= 1 << level;
+                }
+            }
+            index
+        }
+
+        // Generation tree: insert each leaf via try_update_hash (creates real Leaf nodes)
+        let gen_paths: Vec<TreeInsertionPath<ledger::dust::DustGenerationInfo>> =
+            serialize::tagged_deserialize_sequence(gen_evidence)
+                .map_err(|e| JsError::new(&format!("invalid generation evidence: {e}")))?;
+        for (count, path) in gen_paths.into_iter().enumerate() {
+            let (hash, aux) = path.leaf;
+            let index = path_to_index(&path.path);
+            self.0.generating_tree = self.0.generating_tree
+                .try_update_hash(index, hash, aux)
+                .map_err(|e| JsError::new(&format!("expand gen leaf {count} at index {index} failed: {e:?}")))?;
+        }
+
+        // Commitment tree: insert each leaf via try_update_hash
+        let com_paths: Vec<TreeInsertionPath<()>> =
+            serialize::tagged_deserialize_sequence(com_evidence)
+                .map_err(|e| JsError::new(&format!("invalid commitment evidence: {e}")))?;
+        for (count, path) in com_paths.into_iter().enumerate() {
+            let (hash, aux) = path.leaf;
+            let index = path_to_index(&path.path);
+            self.0.commitment_tree = self.0.commitment_tree
+                .try_update_hash(index, hash, aux)
+                .map_err(|e| JsError::new(&format!("expand com leaf {count} at index {index} failed: {e:?}")))?;
+        }
+
+        self.0.generating_tree = self.0.generating_tree.rehash();
+        self.0.commitment_tree = self.0.commitment_tree.rehash();
+        Ok(self)
+    }
+
     /// Applies batch dtime (generation info) updates from raw binary.
     #[wasm_bindgen(js_name = "applyDtimeUpdates")]
     pub fn apply_dtime_updates(mut self, raw: &[u8]) -> Result<DustLocalState, JsError> {
