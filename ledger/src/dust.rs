@@ -1559,6 +1559,25 @@ impl<D: DB> DustLocalState<D> {
         Ok(state)
     }
 
+    /// Inserts a found dust UTXO from fast-sync evidence into the wallet state.
+    pub fn insert_found_utxo(
+        &self,
+        sk: &DustSecretKey,
+        qdo: QualifiedDustOutput,
+        generation_index: u64,
+    ) -> Result<Self, transient_crypto::merkle_tree::InvalidUpdate> {
+        let nullifier = qdo.nullifier(sk);
+        let com = HashOutput::from(qdo.commitment());
+        let mut res = self.clone();
+        res.commitment_tree = res.commitment_tree.try_update_hash(qdo.mt_index, com, ())?;
+        res.dust_utxos = res.dust_utxos.insert(
+            nullifier,
+            DustWalletUtxoState { utxo: qdo, pending_until: None },
+        );
+        res.night_indices = res.night_indices.insert(qdo.backing_night, generation_index);
+        Ok(res)
+    }
+
     pub fn remove_generation_info(
         &self,
         generation_index: u64,

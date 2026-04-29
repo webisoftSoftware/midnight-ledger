@@ -206,6 +206,36 @@ impl ZswapLocalState {
         ))
     }
 
+    // ── 1AM wallet additions ──
+
+    /// Scans raw serialized events for coins using secret keys.
+    #[wasm_bindgen(js_name = "scanCoinsWithChangesFromRaw")]
+    pub fn scan_coins_with_changes_from_raw(
+        self,
+        secret_keys: &ZswapSecretKeys,
+        raw_events: &[u8],
+    ) -> Result<ZswapLocalStateWithChanges, JsError> {
+        let events: Vec<_> = tagged_deserialize_sequence(raw_events)?;
+        let with_changes = self.0
+            .replay_events_with_changes(&secret_keys.try_into()?, events.iter())?;
+        Ok(ZswapLocalStateWithChanges::from(with_changes))
+    }
+
+    /// Expands collapsed merkle paths from serialized insertion evidence.
+    #[wasm_bindgen(js_name = "expandFromEvidence")]
+    pub fn expand_from_evidence(mut self, evidence_data: &[u8]) -> Result<ZswapLocalState, JsError> {
+        use transient_crypto::merkle_tree::TreeInsertionPath;
+        let paths: Vec<TreeInsertionPath<()>> = serialize::tagged_deserialize_sequence(evidence_data)
+            .map_err(|e| JsError::new(&format!("invalid evidence: {e}")))?;
+        for (count, path) in paths.into_iter().enumerate() {
+            self.0.merkle_tree = self.0.merkle_tree
+                .update_from_evidence(path)
+                .map_err(|e| JsError::new(&format!("expand path {count} failed: {e:?}")))?;
+        }
+        self.0.merkle_tree = self.0.merkle_tree.rehash();
+        Ok(self)
+    }
+
     #[wasm_bindgen(js_name = "replayEventsWithChanges")]
     pub fn replay_events_with_changes(
         &self,

@@ -1571,6 +1571,126 @@ impl DustLocalState {
     pub fn sync_time(&self) -> Date {
         seconds_to_js_date(self.0.sync_time.to_secs())
     }
+
+    // ── 1AM wallet additions ──
+
+    /// Sets firstFree for both generating and commitment trees.
+    #[wasm_bindgen(js_name = "setFirstFree")]
+    pub fn set_first_free(mut self, commit_first_free: u64, gen_first_free: u64) -> DustLocalState {
+        self.0.commitment_tree_first_free = commit_first_free;
+        self.0.generating_tree_first_free = gen_first_free;
+        self
+    }
+
+    /// Expands collapsed merkle paths in both dust trees from serialized evidence.
+    #[wasm_bindgen(js_name = "expandFromEvidence")]
+    pub fn expand_from_evidence(
+        mut self,
+        gen_evidence: &[u8],
+        com_evidence: &[u8],
+    ) -> Result<DustLocalState, JsError> {
+        use transient_crypto::merkle_tree::TreeInsertionPath;
+
+        let gen_paths: Vec<TreeInsertionPath<ledger::dust::DustGenerationInfo>> =
+            serialize::tagged_deserialize_sequence(gen_evidence)
+                .map_err(|e| JsError::new(&format!("invalid generation evidence: {e}")))?;
+        for (count, path) in gen_paths.into_iter().enumerate() {
+            self.0.generating_tree = self.0.generating_tree
+                .update_from_evidence(path)
+                .map_err(|e| JsError::new(&format!("expand generation path {count} failed: {e:?}")))?;
+        }
+
+        let com_paths: Vec<TreeInsertionPath<()>> =
+            serialize::tagged_deserialize_sequence(com_evidence)
+                .map_err(|e| JsError::new(&format!("invalid commitment evidence: {e}")))?;
+        for (count, path) in com_paths.into_iter().enumerate() {
+            self.0.commitment_tree = self.0.commitment_tree
+                .update_from_evidence(path)
+                .map_err(|e| JsError::new(&format!("expand commitment path {count} failed: {e:?}")))?;
+        }
+
+        self.0.generating_tree = self.0.generating_tree.rehash();
+        self.0.commitment_tree = self.0.commitment_tree.rehash();
+        Ok(self)
+    }
+
+    /// Applies batch dtime (generation info) updates from raw binary.
+    #[wasm_bindgen(js_name = "applyDtimeUpdates")]
+    pub fn apply_dtime_updates(mut self, raw: &[u8]) -> Result<DustLocalState, JsError> {
+        let mut offset = 0usize;
+        if raw.len() < 4 { return Ok(self); }
+        let count = u32::from_le_bytes(raw[offset..offset+4].try_into().unwrap()) as usize;
+        offset += 4;
+        for i in 0..count {
+            if offset + 8 > raw.len() { break; }
+            let generation_index = u64::from_le_bytes(raw[offset..offset+8].try_into().unwrap());
+            offset += 8;
+            if offset + 4 > raw.len() { break; }
+            let gen_info_len = u32::from_le_bytes(raw[offset..offset+4].try_into().unwrap()) as usize;
+            offset += 4;
+            if offset + gen_info_len > raw.len() { break; }
+            let gen_info: ledger::dust::DustGenerationInfo = serialize::tagged_deserialize(&raw[offset..offset+gen_info_len])
+                .map_err(|e| JsError::new(&format!("dtime update {i}: invalid gen_info: {e}")))?;
+            offset += gen_info_len;
+            self.0.generating_tree = self.0.generating_tree
+                .try_update_hash(generation_index, gen_info.merkle_hash(), gen_info)
+                .map_err(|e| JsError::new(&format!("dtime update {i}: tree update failed at index {generation_index}: {e:?}")))?;
+        }
+        self.0.generating_tree = self.0.generating_tree.rehash();
+        Ok(self)
+    }
+
+    /// Inserts a found dust UTXO. Computes nullifier from secret key.
+    #[wasm_bindgen(js_name = "insertFoundDustUtxo")]
+    pub fn insert_found_dust_utxo(
+        self,
+        sk: &DustSecretKey,
+        output_bytes: &[u8],
+        generation_index: u64,
+    ) -> Result<DustLocalState, JsError> {
+        let sk_inner = sk.try_unwrap()?;
+        let output: ledger::dust::QualifiedDustOutput = serialize::tagged_deserialize(output_bytes)
+            .map_err(|e| JsError::new(&format!("invalid dust output: {e}")))?;
+        let mut state = self.0.insert_found_utxo(&sk_inner, output, generation_index)?;
+        state.commitment_tree = state.commitment_tree.rehash();
+        Ok(DustLocalState(state))
+    }
+
+    /// Batch insert found dust UTXOs from raw binary.
+    #[wasm_bindgen(js_name = "insertFoundDustUtxosBatch")]
+    pub fn insert_found_dust_utxos_batch(
+        mut self,
+        sk: &DustSecretKey,
+        raw: &[u8],
+    ) -> Result<DustLocalState, JsError> {
+        let sk_inner = sk.try_unwrap()?;
+        let mut cursor = raw;
+        let mut count = 0u32;
+        while cursor.len() >= 4 {
+            let output_len = u32::from_le_bytes(cursor[..4].try_into().map_err(|_| JsError::new("truncated output_len"))?) as usize;
+            cursor = &cursor[4..];
+            if cursor.len() < output_len { break; }
+            let output_bytes = &cursor[..output_len];
+            cursor = &cursor[output_len..];
+
+            if cursor.len() < 4 { break; }
+            let gen_info_len = u32::from_le_bytes(cursor[..4].try_into().map_err(|_| JsError::new("truncated gen_info_len"))?) as usize;
+            cursor = &cursor[4..];
+            if cursor.len() < gen_info_len { break; }
+            cursor = &cursor[gen_info_len..];
+
+            if cursor.len() < 8 { break; }
+            let generation_index = u64::from_le_bytes(cursor[..8].try_into().map_err(|_| JsError::new("truncated generation_index"))?) ;
+            cursor = &cursor[8..];
+
+            let output: ledger::dust::QualifiedDustOutput = serialize::tagged_deserialize(output_bytes)
+                .map_err(|e| JsError::new(&format!("invalid dust output at index {count}: {e}")))?;
+            self.0 = self.0.insert_found_utxo(&sk_inner, output, generation_index)?;
+            count += 1;
+        }
+        self.0.commitment_tree = self.0.commitment_tree.rehash();
+        Ok(self)
+    }
 }
 
 #[wasm_bindgen]
