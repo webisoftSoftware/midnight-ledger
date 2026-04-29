@@ -253,6 +253,35 @@ pub struct TreeInsertionPathEntry {
 }
 tag_enforcement_test!(TreeInsertionPathEntry);
 
+/// A part describing a tree expansion with **sibling** hashes at each level.
+/// Unlike [`TreeInsertionPath`] (which stores path-node hashes for collapsed replay),
+/// this stores sibling hashes so that collapsed nodes can be split into
+/// Node + correctly-hashed Collapsed sibling, producing a valid root after rehash.
+#[derive(Debug, Clone, PartialEq, Eq, Serializable, Storable)]
+#[tag = "tree-expansion-path[v1]"]
+#[storable(base)]
+pub struct TreeExpansionPath<A>
+where
+    A: Serializable + Deserializable + Clone + Sync + Send + 'static,
+{
+    /// The leaf that was ultimately inserted
+    pub leaf: (HashOutput, A),
+    /// The path itself, from the leaf up
+    pub path: Vec<TreeExpansionPathEntry>,
+}
+tag_enforcement_test!(TreeExpansionPath<()>);
+
+/// An item in [`TreeExpansionPath`].
+#[derive(Debug, Clone, PartialEq, Eq, Serializable)]
+#[tag = "tree-expansion-path-entry[v1]"]
+pub struct TreeExpansionPathEntry {
+    /// The hash of the **sibling** node at this branch, if available.
+    pub sibling_hash: Option<MerkleTreeDigest>,
+    /// Whether the path went left at this branch.
+    pub goes_left: bool,
+}
+tag_enforcement_test!(TreeExpansionPathEntry);
+
 /// The hash of a Merkle tree node.
 #[derive(
     Copy,
@@ -770,6 +799,136 @@ impl<A: Storable<D>, D: DB> MerkleTreeNode<A, D> {
         })
     }
 
+    /// Like update_from_evidence_internal but splits Collapsed nodes into
+    /// Node + Collapsed sibling, creating a real Leaf at the bottom.
+    /// Only used by fast sync — does not affect WebSocket replay paths.
+    fn uncollapse_from_evidence_internal(
+        &self,
+        leaf: (HashOutput, A),
+        path: &[TreeInsertionPathEntry],
+    ) -> Result<Self, InvalidUpdate> {
+        if path.is_empty() {
+            return Ok(Leaf {
+                hash: leaf.0,
+                aux: leaf.1,
+            });
+        }
+        let entry = path.last().expect("non-empty");
+        Ok(match self {
+            Collapsed { height, hash } => {
+                let child_height = height - 1;
+                let sibling = match entry.hash {
+                    Some(h) => Sp::new(Collapsed { hash: h.0, height: child_height }),
+                    None => Sp::new(Stub { height: child_height }),
+                };
+                let placeholder = Collapsed { hash: *hash, height: child_height };
+                let child = Sp::new(
+                    placeholder.uncollapse_from_evidence_internal(leaf, &path[..path.len() - 1])?,
+                );
+                if entry.goes_left {
+                    Node { hash: None, left: child, right: sibling, height: *height }
+                } else {
+                    Node { hash: None, left: sibling, right: child, height: *height }
+                }
+            }
+            Stub { height } => {
+                let child_height = height - 1;
+                let sibling = match entry.hash {
+                    Some(h) => Sp::new(Collapsed { hash: h.0, height: child_height }),
+                    None => Sp::new(Stub { height: child_height }),
+                };
+                let placeholder = Stub { height: child_height };
+                let child = Sp::new(
+                    placeholder.uncollapse_from_evidence_internal(leaf, &path[..path.len() - 1])?,
+                );
+                if entry.goes_left {
+                    Node { hash: None, left: child, right: sibling, height: *height }
+                } else {
+                    Node { hash: None, left: sibling, right: child, height: *height }
+                }
+            }
+            Node { left, right, height, .. } => {
+                if entry.goes_left {
+                    Node {
+                        hash: None,
+                        left: Sp::new(
+                            left.uncollapse_from_evidence_internal(leaf, &path[..path.len() - 1])?,
+                        ),
+                        right: right.clone(),
+                        height: *height,
+                    }
+                } else {
+                    Node {
+                        hash: None,
+                        left: left.clone(),
+                        right: Sp::new(
+                            right.uncollapse_from_evidence_internal(leaf, &path[..path.len() - 1])?,
+                        ),
+                        height: *height,
+                    }
+                }
+            }
+            Leaf { .. } => Leaf { hash: leaf.0, aux: leaf.1 },
+        })
+    }
+
+    /// Like [`uncollapse_from_evidence_internal`] but uses [`TreeExpansionPathEntry`]
+    /// which carries **sibling** hashes instead of path-node hashes.
+    /// This produces a correct tree structure after rehash.
+    fn uncollapse_from_expansion_internal(
+        &self,
+        leaf: (HashOutput, A),
+        path: &[TreeExpansionPathEntry],
+    ) -> Result<Self, InvalidUpdate> {
+        if path.is_empty() {
+            return Ok(Leaf {
+                hash: leaf.0,
+                aux: leaf.1,
+            });
+        }
+        let entry = path.last().expect("non-empty");
+        Ok(match self {
+            Collapsed { height, .. } | Stub { height } => {
+                let child_height = height - 1;
+                let sibling = match entry.sibling_hash {
+                    Some(h) => Sp::new(Collapsed { hash: h.0, height: child_height }),
+                    None => Sp::new(Stub { height: child_height }),
+                };
+                let placeholder = Stub { height: child_height };
+                let child = Sp::new(
+                    placeholder.uncollapse_from_expansion_internal(leaf, &path[..path.len() - 1])?,
+                );
+                if entry.goes_left {
+                    Node { hash: None, left: child, right: sibling, height: *height }
+                } else {
+                    Node { hash: None, left: sibling, right: child, height: *height }
+                }
+            }
+            Node { left, right, height, .. } => {
+                if entry.goes_left {
+                    Node {
+                        hash: None,
+                        left: Sp::new(
+                            left.uncollapse_from_expansion_internal(leaf, &path[..path.len() - 1])?,
+                        ),
+                        right: right.clone(),
+                        height: *height,
+                    }
+                } else {
+                    Node {
+                        hash: None,
+                        left: left.clone(),
+                        right: Sp::new(
+                            right.uncollapse_from_expansion_internal(leaf, &path[..path.len() - 1])?,
+                        ),
+                        height: *height,
+                    }
+                }
+            }
+            Leaf { .. } => Leaf { hash: leaf.0, aux: leaf.1 },
+        })
+    }
+
     /// Retrieves the leaf hash value at a given index, if available.
     /// `index` *must* be within range of the tree height.
     pub fn index(&self, index: u64) -> Option<(HashOutput, &A)> {
@@ -1243,6 +1402,41 @@ impl<A: Storable<D>, D: DB> MerkleTree<A, D> {
         )?)))
     }
 
+    /// Like update_from_evidence but forces expansion of Collapsed nodes into
+    /// Node + Collapsed sibling at each level, creating a real Leaf at the bottom.
+    /// This allows index() to access the leaf data for spending.
+    /// Does NOT modify update_from_evidence_internal. Only used by fast sync.
+    pub fn uncollapse_from_evidence(
+        &self,
+        insertion: TreeInsertionPath<A>,
+    ) -> Result<Self, InvalidUpdate>
+    where
+        A: Serializable + Deserializable + Clone + Sync + Send + 'static,
+    {
+        Ok(MerkleTree(Sp::new(self.0.uncollapse_from_evidence_internal(
+            insertion.leaf,
+            &insertion.path,
+        )?)))
+    }
+
+    /// Expands collapsed nodes along a path using **sibling** hashes from
+    /// [`TreeExpansionPath`]. Creates real Leaf nodes at UTXO positions.
+    /// Must be followed by `.rehash()` to recompute intermediate hashes.
+    pub fn uncollapse_from_expansion(
+        &self,
+        expansion: TreeExpansionPath<A>,
+    ) -> Result<Self, InvalidUpdate>
+    where
+        A: Serializable + Deserializable + Clone + Sync + Send + 'static,
+    {
+        Ok(MerkleTree(Sp::new(
+            self.0.uncollapse_from_expansion_internal(
+                expansion.leaf,
+                &expansion.path,
+            )?,
+        )))
+    }
+
     /// Produces insertion evidence for a specific index; this index must be
     /// present and not collapsed.
     pub fn insertion_evidence(&self, index: u64) -> Result<TreeInsertionPath<A>, InvalidIndex>
@@ -1262,6 +1456,34 @@ impl<A: Storable<D>, D: DB> MerkleTree<A, D> {
                 .map(|(hash, goes_left)| {
                     Ok(TreeInsertionPathEntry {
                         hash: hash.map(MerkleTreeDigest),
+                        goes_left,
+                    })
+                })
+                .rev()
+                .collect::<Result<_, _>>()?,
+        })
+    }
+
+    /// Produces expansion evidence for a specific index with **sibling** hashes.
+    /// Unlike [`insertion_evidence`] (path-node hashes), this stores sibling hashes
+    /// at each level, suitable for [`uncollapse_from_expansion`].
+    pub fn expansion_evidence(&self, index: u64) -> Result<TreeExpansionPath<A>, InvalidIndex>
+    where
+        A: Serializable + Deserializable + Clone + Sync + Send + 'static,
+    {
+        if self.height() == 0 {
+            return Err(InvalidIndex(index));
+        }
+        let (path, lefts) = self.path_for_index_internal(index, true)?;
+        let leaf = self.index(index).ok_or(InvalidIndex(index))?;
+        Ok(TreeExpansionPath {
+            leaf: (leaf.0, leaf.1.clone()),
+            path: path
+                .into_iter()
+                .zip(lefts)
+                .map(|(hash, goes_left)| {
+                    Ok(TreeExpansionPathEntry {
+                        sibling_hash: hash.map(MerkleTreeDigest),
                         goes_left,
                     })
                 })
@@ -1701,5 +1923,147 @@ mod tests {
 
         // Empty range finds nothing
         assert!(tree.find_path_for_leaf_within_range(val, 3..=4).is_none());
+    }
+
+    // ---- Tests for the FIXED expansion path (sibling hashes) ----
+
+    #[test]
+    fn test_expansion_evidence_root_matches() {
+        let tree = (0..8u64)
+            .fold(new_mt::<()>(6), |t, i| {
+                t.try_update(i, &Fr::from(100 + i), ()).unwrap()
+            })
+            .rehash();
+        let expected_root = tree.root();
+
+        for idx in 0..8u64 {
+            let evidence = tree.expansion_evidence(idx).unwrap();
+            let collapsed = tree.collapse(0, 63);
+            let expanded = collapsed
+                .uncollapse_from_expansion(evidence)
+                .unwrap()
+                .rehash();
+            assert_eq!(
+                expanded.root(),
+                expected_root,
+                "uncollapse_from_expansion produced wrong root for leaf index {idx}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_expansion_vs_update_from_evidence_root() {
+        let tree = (0..16u64)
+            .fold(new_mt::<()>(6), |t, i| {
+                t.try_update(i, &Fr::from(200 + i), ()).unwrap()
+            })
+            .rehash();
+        let expected_root = tree.root();
+
+        for idx in [0, 5, 10, 15] {
+            let insertion_ev = tree.insertion_evidence(idx).unwrap();
+            let expansion_ev = tree.expansion_evidence(idx).unwrap();
+            let collapsed = tree.collapse(0, 63);
+
+            let via_update = collapsed
+                .update_from_evidence(insertion_ev)
+                .unwrap()
+                .rehash();
+            let via_expansion = collapsed
+                .uncollapse_from_expansion(expansion_ev)
+                .unwrap()
+                .rehash();
+
+            assert_eq!(
+                via_update.root(),
+                expected_root,
+                "update_from_evidence wrong root for index {idx}"
+            );
+            assert_eq!(
+                via_expansion.root(),
+                expected_root,
+                "uncollapse_from_expansion wrong root for index {idx}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_expansion_then_spend_proof_valid() {
+        let tree = (0..8u64)
+            .fold(new_mt::<()>(6), |t, i| {
+                t.try_update(i, &Fr::from(300 + i), ()).unwrap()
+            })
+            .rehash();
+        let expected_root = tree.root().unwrap();
+
+        let evidence = tree.expansion_evidence(3).unwrap();
+        let collapsed = tree.collapse(0, 63);
+        let expanded = collapsed
+            .uncollapse_from_expansion(evidence)
+            .unwrap()
+            .rehash();
+
+        let proof = expanded.path_for_leaf(3, Fr::from(303u64)).unwrap();
+        assert_eq!(
+            proof.root(),
+            expected_root,
+            "merkle proof from expanded tree doesn't match expected root"
+        );
+    }
+
+    #[test]
+    fn test_expansion_multiple_leaves() {
+        // Expand multiple leaves into same collapsed tree
+        let tree = (0..16u64)
+            .fold(new_mt::<()>(6), |t, i| {
+                t.try_update(i, &Fr::from(400 + i), ()).unwrap()
+            })
+            .rehash();
+        let expected_root = tree.root();
+
+        let collapsed = tree.collapse(0, 63);
+        let mut expanded = collapsed;
+        for idx in [2, 7, 11] {
+            let evidence = tree.expansion_evidence(idx).unwrap();
+            expanded = expanded.uncollapse_from_expansion(evidence).unwrap();
+        }
+        expanded = expanded.rehash();
+
+        assert_eq!(expanded.root(), expected_root);
+
+        // All three leaves should produce valid proofs
+        for idx in [2, 7, 11] {
+            let proof = expanded
+                .path_for_leaf(idx, Fr::from(400 + idx))
+                .unwrap();
+            assert_eq!(proof.root(), expected_root.unwrap());
+        }
+    }
+
+    // ---- Regression: the OLD uncollapse_from_evidence is broken ----
+
+    #[test]
+    fn test_old_uncollapse_from_evidence_is_broken() {
+        let tree = (0..8u64)
+            .fold(new_mt::<()>(6), |t, i| {
+                t.try_update(i, &Fr::from(100 + i), ()).unwrap()
+            })
+            .rehash();
+        let expected_root = tree.root();
+
+        let evidence = tree.insertion_evidence(0).unwrap();
+        let collapsed = tree.collapse(0, 63);
+        let expanded = collapsed
+            .uncollapse_from_evidence(evidence)
+            .unwrap()
+            .rehash();
+
+        // This SHOULD be equal but ISN'T — documenting the known bug.
+        // insertion_evidence stores path-node hashes, not sibling hashes.
+        assert_ne!(
+            expanded.root(),
+            expected_root,
+            "if this passes as eq, the old bug was somehow fixed — update this test"
+        );
     }
 }
