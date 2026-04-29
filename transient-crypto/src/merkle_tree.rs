@@ -431,6 +431,16 @@ impl MerkleTreeCollapsedUpdate {
         }
         Ok(MerkleTreeCollapsedUpdate { start, end, hashes })
     }
+
+    /// Public wrapper around `step_sizes` for server-side collapsed update construction.
+    pub fn step_sizes_pub(a: u64, b: u64) -> Vec<u8> {
+        Self::step_sizes(a, b)
+    }
+
+    /// Constructs a `MerkleTreeCollapsedUpdate` from pre-computed hashes.
+    pub fn from_raw(start: u64, end: u64, hashes: Vec<MerkleTreeDigest>) -> Self {
+        Self { start, end, hashes }
+    }
 }
 
 /// A Merkle tree, represented sparsely.
