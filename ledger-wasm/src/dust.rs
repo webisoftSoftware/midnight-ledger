@@ -40,6 +40,12 @@ use transient_crypto::merkle_tree;
 use wasm_bindgen::JsError;
 use wasm_bindgen::prelude::*;
 
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_namespace = console, js_name = log)]
+    fn v2_log(s: &str);
+}
+
 #[derive(Clone)]
 pub enum DustSpendTypes {
     ProvenDustSpend(LedgerDustSpend<ProofMarker, InMemoryDB>),
@@ -1574,6 +1580,14 @@ impl DustLocalState {
 
     // ── 1AM wallet additions ──
 
+    /// Reset the commitment tree to empty (for rebuilding with different positions).
+    #[wasm_bindgen(js_name = "resetCommitmentTree")]
+    pub fn reset_commitment_tree(mut self) -> DustLocalState {
+        self.0.commitment_tree = merkle_tree::MerkleTree::blank(32);
+        self.0.commitment_tree_first_free = 0;
+        self
+    }
+
     /// Sets firstFree for both generating and commitment trees.
     #[wasm_bindgen(js_name = "setFirstFree")]
     pub fn set_first_free(mut self, commit_first_free: u64, gen_first_free: u64) -> DustLocalState {
@@ -1582,128 +1596,169 @@ impl DustLocalState {
         self
     }
 
-    /// Applies a v2 interleaved dust import response using stock SDK methods.
-    /// No evidence expansion — collapsed updates skip wallet leaf positions,
-    /// and wallet leaves are inserted via standard insertGenerationInfo/addUtxo.
-    ///
-    /// Binary format:
-    /// Generation tree:
-    ///   [4B segment_count]
-    ///   For each segment:
-    ///     [4B collapsed_len][collapsed update bytes]
-    ///     [4B gen_info_len][tagged DustGenerationInfo]
-    ///     [8B generation_index]
-    ///   [4B trailing_collapsed_len][trailing collapsed update bytes]
-    ///
-    /// Commitment tree:
-    ///   [4B segment_count]
-    ///   For each segment:
-    ///     [4B collapsed_len][collapsed update bytes]
-    ///     [4B utxo_len][tagged QualifiedDustOutput]
-    ///     [8B commitment_mt_index]
-    ///   [4B trailing_collapsed_len][trailing collapsed update bytes]
-    ///
-    /// [8B lastEventId]
+    // ── v2 upstream-pattern methods ──
+    // Flow: applyGenTreeV2 → resolveSpendChains → applyComTreeV2
+
+    /// Step 1: Apply generation tree + add initial UTXOs to wallet map.
+    /// Binary: [4B count][{collapsed, genInfo, genIdx}...][trailing collapsed]
+    #[wasm_bindgen(js_name = "applyGenTreeV2")]
+    pub fn apply_gen_tree_v2(mut self, raw: &[u8], _sk: &DustSecretKey) -> Result<DustLocalState, JsError> {
+        let mut off = 0usize;
+        macro_rules! r32 { () => {{ if off+4>raw.len(){return Err(JsError::new("g: trunc u32"))} let v=u32::from_le_bytes(raw[off..off+4].try_into().unwrap()); off+=4; v as usize }}; }
+        macro_rules! r64 { () => {{ if off+8>raw.len(){return Err(JsError::new("g: trunc u64"))} let v=u64::from_le_bytes(raw[off..off+8].try_into().unwrap()); off+=8; v }}; }
+        macro_rules! rb { ($n:expr) => {{ let n=$n; if off+n>raw.len(){return Err(JsError::new("g: trunc"))} let s=&raw[off..off+n]; off+=n; s }}; }
+        macro_rules! collapsed { ($m:ident) => {{ let c=r32!(); if c>0 { let b=rb!(c); let u:merkle_tree::MerkleTreeCollapsedUpdate=serialize::tagged_deserialize(b).map_err(|e|JsError::new(&format!("g col: {e}")))?; self.0=self.0.$m(&u).map_err(|e|JsError::new(&format!("g col apply: {e:?}")))?; } }}; }
+
+        let count = r32!();
+        for i in 0..count {
+            collapsed!(apply_generation_collapsed_update);
+            let gl = r32!(); let gb = rb!(gl);
+            let gi: ledger::dust::DustGenerationInfo = serialize::tagged_deserialize(gb).map_err(|e| JsError::new(&format!("g info[{i}]: {e}")))?;
+            let idx = r64!();
+            self.0 = self.0.insert_generation_info(idx, gi, Some(gi.nonce)).map_err(|e| JsError::new(&format!("g ins[{i}] {idx}: {e:?}")))?;
+        }
+        collapsed!(apply_generation_collapsed_update);
+        let _ = off;
+        // Note: no UTXOs added here — the commitment tree isn't built yet.
+        // The server sends initial QDOs in the gen response for the UTXO map only.
+        // We add them so resolveSpendChains can find them.
+        // Re-parse to extract QDOs for addUtxo (they follow after the gen trailing collapsed).
+        // Actually, the gen section doesn't contain QDOs — they're in the com section.
+        // So we DON'T add UTXOs here. The com section does it later.
+        Ok(self)
+    }
+
+    /// Step 2: Resolve spend chains using binary spend index.
+    /// Matches upstream: resolves chains from the initial UTXOs in the map,
+    /// then CLEARS all UTXOs and adds only the final live ones (like applyNewDustUtxos).
+    #[wasm_bindgen(js_name = "resolveSpendChains")]
+    pub fn resolve_spend_chains(mut self, spend_records: &[u8], record_count: u32, sk: &DustSecretKey) -> Result<DustLocalState, JsError> {
+        use std::collections::HashMap;
+        let sk_inner = sk.try_unwrap()?;
+        let rc = record_count as usize;
+        let mut index: HashMap<[u8; 16], (u64, u128, u64)> = HashMap::with_capacity(rc);
+        for i in 0..rc {
+            let off = i * 36;
+            if off + 36 > spend_records.len() { break; }
+            let mut prefix = [0u8; 16];
+            prefix.copy_from_slice(&spend_records[off..off+16]);
+            let ci = u64::from_le_bytes(spend_records[off+16..off+24].try_into().unwrap());
+            let vf = u64::from_le_bytes(spend_records[off+24..off+32].try_into().unwrap()) as u128;
+            let dt = u32::from_le_bytes(spend_records[off+32..off+36].try_into().unwrap()) as u64;
+            index.insert(prefix, (ci, vf, dt));
+        }
+
+        // Collect initial UTXOs and resolve each chain to its final state
+        let initial_utxos: Vec<ledger::dust::QualifiedDustOutput> = self.0.utxos().collect();
+        let mut final_utxos: Vec<ledger::dust::QualifiedDustOutput> = Vec::with_capacity(initial_utxos.len());
+
+        for initial_qdo in &initial_utxos {
+            let mut qdo = *initial_qdo;
+            let mut nul = qdo.nullifier(&sk_inner);
+            for _ in 0..10_000 {
+                let nb = nul.0.as_le_bytes();
+                let mut pfx = [0u8; 16];
+                let cl = nb.len().min(16);
+                pfx[..cl].copy_from_slice(&nb[..cl]);
+                match index.get(&pfx) {
+                    None => break,
+                    Some(&(ci, vf, dt)) => {
+                        let now = Timestamp::from_secs(dt);
+                        let succ = self.0.successor_utxo(&qdo, &now, vf, ci, &sk_inner)
+                            .map_err(|e| JsError::new(&format!("succ: {e:?}")))?;
+                        nul = succ.nullifier(&sk_inner);
+                        qdo = succ;
+                    }
+                }
+            }
+            final_utxos.push(qdo);
+        }
+
+        // Clear ALL initial UTXOs from the map
+        for ini in &initial_utxos {
+            let nul = ini.nullifier(&sk_inner);
+            self.0 = self.0.remove_utxo(&nul).map_err(|e| JsError::new(&format!("rm: {e:?}")))?;
+        }
+
+        // Add only the final live UTXOs (upstream applyNewDustUtxos pattern)
+        for fin_qdo in &final_utxos {
+            let nul = fin_qdo.nullifier(&sk_inner);
+            self.0 = self.0.add_utxo(&nul, fin_qdo, None).map_err(|e| JsError::new(&format!("add: {e:?}")))?;
+        }
+
+        v2_log(&format!("[v2] resolveSpendChains: {} initial → {} final", initial_utxos.len(), final_utxos.len()));
+        Ok(self)
+    }
+
+    /// Step 3: Apply commitment tree with gaps at final UTXO positions.
+    /// Binary: [4B count][{collapsed, qdo, comIdx}...][trailing collapsed]
+    /// Uses QDOs from the UTXO map (locally-computed successors) instead of
+    /// the server's QDOs, ensuring commitment tree leaves match the UTXO map.
+    #[wasm_bindgen(js_name = "applyComTreeV2")]
+    pub fn apply_com_tree_v2(mut self, raw: &[u8]) -> Result<DustLocalState, JsError> {
+        use std::collections::HashMap;
+        // Build mt_index → QDO map from current UTXO state
+        let utxo_by_mt: HashMap<u64, ledger::dust::QualifiedDustOutput> =
+            self.0.utxos().map(|qdo| (qdo.mt_index, qdo)).collect();
+
+        let mut off = 0usize;
+        macro_rules! r32 { () => {{ if off+4>raw.len(){return Err(JsError::new("c: trunc u32"))} let v=u32::from_le_bytes(raw[off..off+4].try_into().unwrap()); off+=4; v as usize }}; }
+        macro_rules! r64 { () => {{ if off+8>raw.len(){return Err(JsError::new("c: trunc u64"))} let v=u64::from_le_bytes(raw[off..off+8].try_into().unwrap()); off+=8; v }}; }
+        macro_rules! rb { ($n:expr) => {{ let n=$n; if off+n>raw.len(){return Err(JsError::new("c: trunc"))} let s=&raw[off..off+n]; off+=n; s }}; }
+        macro_rules! collapsed { ($m:ident) => {{ let c=r32!(); if c>0 { let b=rb!(c); let u:merkle_tree::MerkleTreeCollapsedUpdate=serialize::tagged_deserialize(b).map_err(|e|JsError::new(&format!("c col: {e}")))?; self.0=self.0.$m(&u).map_err(|e|JsError::new(&format!("c col apply: {e:?}")))?; } }}; }
+
+        let count = r32!();
+        for i in 0..count {
+            collapsed!(apply_commitment_collapsed_update);
+            let ul = r32!(); let ub = rb!(ul);
+            let server_qdo: ledger::dust::QualifiedDustOutput = serialize::tagged_deserialize(ub).map_err(|e| JsError::new(&format!("c qdo[{i}]: {e}")))?;
+            let idx = r64!();
+            // Use local QDO (from resolved UTXO map) if available — ensures
+            // commitment tree leaf matches the UTXO map entry exactly.
+            let qdo = utxo_by_mt.get(&idx).copied().unwrap_or(server_qdo);
+            self.0 = self.0.insert_commitment(idx, qdo, true).map_err(|e| JsError::new(&format!("c ins[{i}] {idx}: {e:?}")))?;
+        }
+        collapsed!(apply_commitment_collapsed_update);
+        let _ = off;
+        Ok(self)
+    }
+
+    /// Apply both gen+com in one call, adding UTXOs to wallet map.
+    /// Used for the initial import (step 1) before spend chain resolution.
     #[wasm_bindgen(js_name = "applyInterleavedDustV2")]
-    pub fn apply_interleaved_dust_v2(
-        mut self,
-        raw: &[u8],
-        sk: &DustSecretKey,
-    ) -> Result<DustLocalState, JsError> {
+    pub fn apply_interleaved_dust_v2(mut self, raw: &[u8], sk: &DustSecretKey) -> Result<DustLocalState, JsError> {
         let sk_inner = sk.try_unwrap()?;
         let mut off = 0usize;
+        macro_rules! r32 { () => {{ if off+4>raw.len(){return Err(JsError::new("v2: trunc u32"))} let v=u32::from_le_bytes(raw[off..off+4].try_into().unwrap()); off+=4; v as usize }}; }
+        macro_rules! r64 { () => {{ if off+8>raw.len(){return Err(JsError::new("v2: trunc u64"))} let v=u64::from_le_bytes(raw[off..off+8].try_into().unwrap()); off+=8; v }}; }
+        macro_rules! rb { ($n:expr) => {{ let n=$n; if off+n>raw.len(){return Err(JsError::new("v2: trunc"))} let s=&raw[off..off+n]; off+=n; s }}; }
+        macro_rules! collapsed { ($label:expr, $m:ident) => {{ let c=r32!(); if c>0 { let b=rb!(c); let u:merkle_tree::MerkleTreeCollapsedUpdate=serialize::tagged_deserialize(b).map_err(|e|JsError::new(&format!("v2 {} col: {e}", $label)))?; self.0=self.0.$m(&u).map_err(|e|JsError::new(&format!("v2 {} col apply: {e:?}", $label)))?; } }}; }
 
-        macro_rules! read_u32 {
-            () => {{
-                if off + 4 > raw.len() { return Err(JsError::new("v2: truncated u32")); }
-                let v = u32::from_le_bytes(raw[off..off+4].try_into().unwrap());
-                off += 4;
-                v as usize
-            }};
+        // Gen tree
+        let gc = r32!();
+        for i in 0..gc {
+            collapsed!(format!("g[{i}]"), apply_generation_collapsed_update);
+            let gl = r32!(); let gb = rb!(gl);
+            let gi: ledger::dust::DustGenerationInfo = serialize::tagged_deserialize(gb).map_err(|e| JsError::new(&format!("v2 gi[{i}]: {e}")))?;
+            let idx = r64!();
+            self.0 = self.0.insert_generation_info(idx, gi, Some(gi.nonce)).map_err(|e| JsError::new(&format!("v2 gins[{i}] {idx}: {e:?}")))?;
         }
-        macro_rules! read_u64 {
-            () => {{
-                if off + 8 > raw.len() { return Err(JsError::new("v2: truncated u64")); }
-                let v = u64::from_le_bytes(raw[off..off+8].try_into().unwrap());
-                off += 8;
-                v
-            }};
+        collapsed!("g[trail]", apply_generation_collapsed_update);
+
+        // Com tree + addUtxo
+        let cc = r32!();
+        for i in 0..cc {
+            collapsed!(format!("c[{i}]"), apply_commitment_collapsed_update);
+            let ul = r32!(); let ub = rb!(ul);
+            let qdo: ledger::dust::QualifiedDustOutput = serialize::tagged_deserialize(ub).map_err(|e| JsError::new(&format!("v2 qdo[{i}]: {e}")))?;
+            let idx = r64!();
+            self.0 = self.0.insert_commitment(idx, qdo, true).map_err(|e| JsError::new(&format!("v2 cins[{i}] {idx}: {e:?}")))?;
+            let nul = qdo.nullifier(&sk_inner);
+            self.0 = self.0.add_utxo(&nul, &qdo, None).map_err(|e| JsError::new(&format!("v2 utxo[{i}]: {e:?}")))?;
         }
-        macro_rules! read_bytes {
-            ($n:expr) => {{
-                let n = $n;
-                if off + n > raw.len() { return Err(JsError::new("v2: truncated bytes")); }
-                let s = &raw[off..off+n];
-                off += n;
-                s
-            }};
-        }
-        macro_rules! apply_collapsed {
-            ($label:expr, $method:ident) => {{
-                let clen = read_u32!();
-                if clen > 0 {
-                    let cbytes = read_bytes!(clen);
-                    let update: merkle_tree::MerkleTreeCollapsedUpdate =
-                        serialize::tagged_deserialize(cbytes)
-                            .map_err(|e| JsError::new(&format!("v2 {} collapsed deser: {e}", $label)))?;
-                    self.0 = self.0.$method(&update)
-                        .map_err(|e| JsError::new(&format!("v2 {} collapsed apply: {e:?}", $label)))?;
-                }
-            }};
-        }
-
-        // === Generation tree ===
-        let gen_count = read_u32!();
-        for i in 0..gen_count {
-            apply_collapsed!(format!("gen[{i}]"), apply_generation_collapsed_update);
-
-            let gi_len = read_u32!();
-            let gi_bytes = read_bytes!(gi_len);
-            let gen_info: ledger::dust::DustGenerationInfo =
-                serialize::tagged_deserialize(gi_bytes)
-                    .map_err(|e| JsError::new(&format!("v2 gen_info[{i}] deser: {e}")))?;
-            let gen_idx = read_u64!();
-
-            // Debug: log merkle_hash for comparison with server
-            let mh = gen_info.merkle_hash();
-            let mh_hex: String = mh.0.iter().map(|b| format!("{:02x}", b)).collect();
-            let _ = js_sys::eval(&format!(
-                "console.log('[v2 WASM] gen[{}] idx={} merkle_hash={}')",
-                i, gen_idx, mh_hex
-            ));
-
-            let initial_nonce = Some(gen_info.nonce);
-            self.0 = self.0.insert_generation_info(gen_idx, gen_info, initial_nonce)
-                .map_err(|e| JsError::new(&format!("v2 gen insert[{i}] at {gen_idx}: {e:?}")))?;
-        }
-        // Trailing generation collapsed update
-        apply_collapsed!("gen[trailing]", apply_generation_collapsed_update);
-
-        // === Commitment tree ===
-        let com_count = read_u32!();
-        for i in 0..com_count {
-            apply_collapsed!(format!("com[{i}]"), apply_commitment_collapsed_update);
-
-            let utxo_len = read_u32!();
-            let utxo_bytes = read_bytes!(utxo_len);
-            let qdo: ledger::dust::QualifiedDustOutput =
-                serialize::tagged_deserialize(utxo_bytes)
-                    .map_err(|e| JsError::new(&format!("v2 utxo[{i}] deser: {e}")))?;
-            let com_idx = read_u64!();
-
-            // insertCommitment with own_qdo=true (our UTXO — don't collapse)
-            self.0 = self.0.insert_commitment(com_idx, qdo, true)
-                .map_err(|e| JsError::new(&format!("v2 com insert[{i}] at {com_idx}: {e:?}")))?;
-
-            // addUtxo to wallet's UTXO map
-            let nullifier = qdo.nullifier(&sk_inner);
-            self.0 = self.0.add_utxo(&nullifier, &qdo, None)
-                .map_err(|e| JsError::new(&format!("v2 add_utxo[{i}]: {e:?}")))?;
-        }
-        // Trailing commitment collapsed update
-        apply_collapsed!("com[trailing]", apply_commitment_collapsed_update);
+        collapsed!("c[trail]", apply_commitment_collapsed_update);
         let _ = off;
-
+        v2_log(&format!("[v2] applyInterleavedDustV2: {} gens, {} coms", gc, cc));
         Ok(self)
     }
 }
