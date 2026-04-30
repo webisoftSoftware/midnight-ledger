@@ -1578,6 +1578,12 @@ impl DustLocalState {
         seconds_to_js_date(self.0.sync_time.to_secs())
     }
 
+    #[wasm_bindgen(js_name = "setSyncTime")]
+    pub fn set_sync_time(mut self, time: &Date) -> DustLocalState {
+        self.0.sync_time = Timestamp::from_secs(js_date_to_seconds(time));
+        self
+    }
+
     // ── 1AM wallet additions ──
 
     /// Reset the commitment tree to empty (for rebuilding with different positions).
@@ -1664,6 +1670,22 @@ impl DustLocalState {
                     None => break,
                     Some(&(ci, vf, dt)) => {
                         let now = Timestamp::from_secs(dt);
+                        // Debug: log every matched spend record
+                        {
+                            v2_log(&format!("[v2-dbg] match utxo#{} seq={} ci={} vf={} dt={} pfx={:02x}{:02x}{:02x}{:02x}",
+                                final_utxos.len(), qdo.seq, ci, vf, dt, pfx[0], pfx[1], pfx[2], pfx[3]));
+                        }
+                        // Debug: log gen_info and updated_value for first UTXO's first hop
+                        if final_utxos.is_empty() && qdo.seq == 0 {
+                            if let Some(gi) = self.0.generation_info(&qdo) {
+                                let v_pre = ledger::dust::DustOutput::from(qdo).updated_value(&gi, now, &self.0.params);
+                                v2_log(&format!("[v2-dbg] utxo0 seq={} ctime={} dtime={} now={} gi.value={} rate={} vfull={} v_pre={} vfee={} v_now={}",
+                                    qdo.seq, qdo.ctime.to_secs(), gi.dtime.to_secs(), dt,
+                                    gi.value, gi.value.saturating_mul(self.0.params.generation_decay_rate as u128),
+                                    gi.value.saturating_mul(self.0.params.night_dust_ratio as u128),
+                                    v_pre, vf, v_pre.saturating_sub(vf)));
+                            }
+                        }
                         let succ = self.0.successor_utxo(&qdo, &now, vf, ci, &sk_inner)
                             .map_err(|e| JsError::new(&format!("succ: {e:?}")))?;
                         nul = succ.nullifier(&sk_inner);
@@ -1687,6 +1709,29 @@ impl DustLocalState {
         }
 
         v2_log(&format!("[v2] resolveSpendChains: {} initial → {} final", initial_utxos.len(), final_utxos.len()));
+        Ok(self)
+    }
+
+    /// Remove UTXOs with updated_value(now) == 0 from the UTXO map.
+    /// The commitment tree is NOT modified — dead UTXOs stay in the tree for valid proofs.
+    #[wasm_bindgen(js_name = "removeDeadUtxos")]
+    pub fn remove_dead_utxos(mut self, now: &Date, sk: &DustSecretKey) -> Result<DustLocalState, JsError> {
+        let sk_inner = sk.try_unwrap()?;
+        let now_ts = Timestamp::from_secs(js_date_to_seconds(now));
+        let dead: Vec<ledger::dust::DustNullifier> = self.0.utxos()
+            .filter_map(|qdo| {
+                let gi = self.0.generation_info(&qdo)?;
+                let val = ledger::dust::DustOutput::from(qdo).updated_value(&gi, now_ts, &self.0.params);
+                if val == 0 { Some(qdo.nullifier(&sk_inner)) } else { None }
+            })
+            .collect();
+        let removed = dead.len();
+        for nul in &dead {
+            self.0 = self.0.remove_utxo(nul).map_err(|e| JsError::new(&format!("rm dead: {e:?}")))?;
+        }
+        if removed > 0 {
+            v2_log(&format!("[v2] removeDeadUtxos: removed {} dead UTXOs", removed));
+        }
         Ok(self)
     }
 
