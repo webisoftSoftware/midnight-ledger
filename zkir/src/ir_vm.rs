@@ -51,6 +51,11 @@ pub struct Preprocessed {
     pub pi_skips: Vec<Option<usize>>,
     pub binding_input: outer::Scalar,
     pub comm_comm: Option<(outer::Scalar, outer::Scalar)>,
+    /// Number of input field elements to place in the committed-instance column.
+    /// When > 0, the first `committed_input_count` elements of `memory` will be
+    /// hidden from the verifier behind a KZG commitment.
+    /// Default: 0 (all inputs visible, original behavior).
+    pub committed_input_count: usize,
 }
 
 fn lnot(
@@ -505,6 +510,7 @@ impl IrSource {
             comm_comm: preimage
                 .communications_commitment
                 .map(|(comm, rand)| (comm.0, rand.0)),
+            committed_input_count: 0,
         })
     }
 }
@@ -518,6 +524,14 @@ impl Relation for IrSource {
         instance: &Self::Instance,
     ) -> Result<Vec<outer::Scalar>, midnight_proofs::plonk::Error> {
         Ok(instance.clone())
+    }
+
+    fn format_committed_instances(witness: &Self::Witness) -> Vec<outer::Scalar> {
+        if witness.committed_input_count > 0 {
+            witness.memory[..witness.committed_input_count].to_vec()
+        } else {
+            vec![]
+        }
     }
 
     fn circuit(

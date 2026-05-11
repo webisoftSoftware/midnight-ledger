@@ -17,8 +17,8 @@ use crate::structure::*;
 use crate::{ZSWAP_TREE_HEIGHT, ciphertext_to_field};
 use base_crypto::fab::AlignedValue;
 use coin_structure::coin::{
-    self, Commitment, Info as CoinInfo, QualifiedInfo as QualifiedCoinInfo,
-    SecretKey as CoinSecretKey,
+    self, Commitment, Info as CoinInfo, Nullifier, PublicKey as CoinPublicKey,
+    QualifiedInfo as QualifiedCoinInfo, SecretKey as CoinSecretKey,
 };
 use coin_structure::contract::ContractAddress;
 use coin_structure::transfer::{Recipient, SenderEvidence};
@@ -73,6 +73,37 @@ impl AuthorizedClaim<ProofPreimage> {
             binding_input: transient_commit(&coin, 0u8.into()),
             communications_commitment: None,
             key_location: KeyLocation(Cow::Borrowed("midnight/zswap/sign")),
+        };
+        Ok(AuthorizedClaim {
+            coin,
+            recipient: pk,
+            proof: Arc::new(proof_preimage),
+        })
+    }
+
+    /// Split-prove: build sign preimage with sk_commitment instead of raw sk.
+    pub fn new_split<R: Rng + CryptoRng + ?Sized, D: DB>(
+        _rng: &mut R,
+        coin: CoinInfo,
+        pk: CoinPublicKey,
+        sk_commitment: Fr,
+    ) -> Result<Self, OfferCreationFailed> {
+        let public_transcript_prog: &[Op<ResultModeVerify, D>] =
+            &Cell_write!([Key::Value(4u8.into())], false, CoinPublicKey, pk);
+        let mut inputs = Vec::new();
+        inputs.push(sk_commitment);
+        let mut public_transcript_inputs = Vec::new();
+        for op in filter_invalid(public_transcript_prog.iter().cloned()) {
+            op.field_repr(&mut public_transcript_inputs);
+        }
+        let proof_preimage = ProofPreimage {
+            inputs,
+            private_transcript: Vec::new(),
+            public_transcript_inputs,
+            public_transcript_outputs: Vec::new(),
+            binding_input: transient_commit(&coin, 0u8.into()),
+            communications_commitment: None,
+            key_location: KeyLocation(Cow::Borrowed("midnight/zswap/sign-split")),
         };
         Ok(AuthorizedClaim {
             coin,
@@ -137,7 +168,7 @@ impl<D: DB> Input<ProofPreimage, D> {
         }
     }
 
-    pub(crate) fn new_from_secret_key<A: Debug + Storable<D>, R: Rng + CryptoRng + ?Sized>(
+    pub fn new_from_secret_key<A: Debug + Storable<D>, R: Rng + CryptoRng + ?Sized>(
         rng: &mut R,
         coin: &QualifiedCoinInfo,
         segment: Option<u16>,
@@ -223,6 +254,92 @@ impl<D: DB> Input<ProofPreimage, D> {
             proof: Arc::new(proof_preimage),
         };
         //debug_assert!(inp.well_formed().is_ok());
+        Ok(inp)
+    }
+
+    /// Split-prove: build spend preimage with sk_commitment instead of raw sk.
+    pub fn new_split<A: Debug + Storable<D>, R: Rng + CryptoRng + ?Sized>(
+        rng: &mut R,
+        coin: &QualifiedCoinInfo,
+        segment: Option<u16>,
+        nullifier: Nullifier,
+        commitment_hash: Commitment,
+        sk_commitment: Fr,
+        is_contract: Option<ContractAddress>,
+        tree: &MerkleTree<A, D>,
+    ) -> Result<Self, OfferCreationFailed> {
+        let rc_e: EmbeddedFr = rng.r#gen();
+        let rc = Fr::try_from(rc_e).expect("Fr should be larger than EmbeddedFr");
+        let value_commitment = Pedersen::commit(
+            &(coin.type_, segment.unwrap_or(0)),
+            &coin.value.into(),
+            &rc_e,
+        );
+        let merkle_tree_root = tree.root().ok_or(OfferCreationFailed::TreeNotRehashed)?;
+        let mut public_transcript_prog: Vec<Op<ResultModeVerify, D>> = Vec::new();
+        public_transcript_prog.extend(
+            HistoricMerkleTree_check_root!(
+                [Key::Value(0u8.into())],
+                false,
+                32,
+                [u8; 32],
+                merkle_tree_root
+            )
+            .into_iter()
+            .map(|op: Op<ResultModeGather, D>| op.translate(|()| true.into())),
+        );
+        public_transcript_prog.extend(Set_insert!(
+            [Key::Value(1u8.into())],
+            false,
+            [u8; 32],
+            nullifier
+        ));
+        if let Some(addr) = &is_contract {
+            public_transcript_prog.extend(Cell_write!(
+                [Key::Value(3u8.into())],
+                false,
+                ContractAddress,
+                *addr
+            ));
+        }
+        public_transcript_prog.extend(
+            Cell_read!([Key::Value(5u8.into())], false, u16)
+                .into_iter()
+                .map(|op: Op<ResultModeGather, _>| op.translate(|()| segment.unwrap_or(0).into())),
+        );
+        public_transcript_prog.extend(Cell_write!(
+            [Key::Value(2u8.into())],
+            false,
+            (Fr, Fr),
+            value_commitment.0
+        ));
+        let mut inputs = Vec::new();
+        inputs.push(sk_commitment);
+        tree.path_for_leaf(coin.mt_index, ((), commitment_hash))
+            .map_err(OfferCreationFailed::InvalidIndex)?
+            .field_repr(&mut inputs);
+        CoinInfo::from(coin).field_repr(&mut inputs);
+        inputs.push(rc);
+        let mut public_transcript_inputs = Vec::new();
+        for op in filter_invalid(public_transcript_prog.into_iter()) {
+            op.field_repr(&mut public_transcript_inputs);
+        }
+        let proof_preimage = ProofPreimage {
+            inputs,
+            private_transcript: Vec::new(),
+            public_transcript_inputs,
+            public_transcript_outputs: vec![true.into(), segment.unwrap_or(0).into()],
+            binding_input: 0.into(),
+            communications_commitment: None,
+            key_location: KeyLocation(Cow::Borrowed("midnight/zswap/spend-split")),
+        };
+        let inp = Input {
+            nullifier,
+            value_commitment,
+            contract_address: is_contract.map(Sp::new),
+            merkle_tree_root,
+            proof: Arc::new(proof_preimage),
+        };
         Ok(inp)
     }
 }

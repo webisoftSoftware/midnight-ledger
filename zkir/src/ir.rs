@@ -77,6 +77,35 @@ impl Zkir for IrSource {
     }
 }
 
+impl IrSource {
+    /// Split-prove variant: marks the first `committed_input_count` witness
+    /// elements as committed instances, hiding them from the verifier.
+    pub async fn prove_split(
+        &self,
+        rng: impl Rng + CryptoRng,
+        params: &impl ParamsProverProvider,
+        pk: ProverKey<Self>,
+        preimage: &ProofPreimage,
+        committed_input_count: usize,
+    ) -> Result<(Proof, Vec<Fr>, Vec<Option<usize>>), ProvingError> {
+        use midnight_zk_stdlib::prove;
+
+        let params_k = params.get_params(pk.init()?.k()).await?;
+        let mut preproc = self.preprocess(preimage)?;
+        preproc.committed_input_count = committed_input_count;
+        let pis = preproc.pis.clone();
+        let pi_skips = preproc.pi_skips.clone();
+
+        let pk = pk
+            .init()
+            .map_err(|_| anyhow::anyhow!("Could not init pk"))?;
+
+        let proof = prove::<_, TranscriptHash>(params_k.as_ref(), &pk, self, &pis, preproc, rng)?;
+
+        Ok((Proof(proof), pis.into_iter().map(Fr).collect(), pi_skips))
+    }
+}
+
 /// An index referring to the circuit memory of the IR machine
 pub type Index = u32;
 
