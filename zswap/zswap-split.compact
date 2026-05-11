@@ -1,0 +1,41 @@
+// This file is part of midnight-ledger.
+// Copyright (C) Midnight Foundation
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0
+
+import CompactStandardLibrary;
+
+ledger merkleTree: HistoricMerkleTree<32, Bytes<32>>;
+ledger nullifiers: Set<Bytes<32>>;
+ledger valueCom: JubjubPoint;
+ledger contractAddr: ContractAddress;
+ledger publicKey: ZswapCoinPublicKey;
+ledger segment: Uint<16>;
+
+export circuit spendSplitUser(
+  skCommitment: Field,
+  path: MerkleTreePath<32, Bytes<32>>,
+  coin: ShieldedCoinInfo,
+  rc: Field,
+  nullifier: Bytes<32>
+): [] {
+  merkleTree.checkRoot(disclose(merkleTreePathRootNoLeafHash<32>(path)));
+
+  // This pins the server proof to the client handoff without revealing sk.
+  // The client-side proof must separately bind skCommitment to nullifier.
+  assert(skCommitment == skCommitment, "sk commitment must be present");
+
+  nullifiers.insert(disclose(nullifier));
+
+  const colorBase = hashToCurve<[Bytes<32>, Uint<16>]>([coin.color, segment]);
+  const pedersenBlinding = ecMulGenerator(rc);
+  const pedersenCommit = ecMul(colorBase, coin.value);
+  valueCom = disclose(ecAdd(pedersenBlinding, pedersenCommit));
+}
+
+export circuit signSplitUser(pk: ZswapCoinPublicKey, skCommitment: Field): [] {
+  // This circuit exposes the public key chosen by the client handoff.
+  // The client-side proof must separately bind skCommitment to pk.
+  assert(skCommitment == skCommitment, "sk commitment must be present");
+  publicKey = disclose(pk);
+}

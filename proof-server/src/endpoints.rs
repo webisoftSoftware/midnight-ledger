@@ -19,7 +19,13 @@ use actix_web::web::{self, Bytes, BytesMut, Data, Payload};
 use actix_web::{Error, HttpResponse, HttpResponseBuilder, Responder, get, post};
 use base_crypto::data_provider::{self, MidnightDataProvider};
 use base_crypto::data_provider::{FetchMode, OutputMode};
-use base_crypto::signatures::Signature;
+use base_crypto::hash::HashOutput;
+use base_crypto::schnorr::Signature;
+use coin_structure::coin::{
+    Commitment, Nullifier, PublicKey as CoinPublicKey, QualifiedInfo as QualifiedCoinInfo,
+    ShieldedTokenType,
+};
+use coin_structure::contract::ContractAddress;
 use futures_util::stream::StreamExt;
 use hex::ToHex;
 use introspection::Introspection;
@@ -30,17 +36,29 @@ use ledger::structure::{
     INITIAL_TRANSACTION_COST_MODEL, ProofPreimageMarker, ProofPreimageVersioned, ProofVersioned,
     Transaction,
 };
+use onchain_runtime::ops::{Key, Op};
+use onchain_runtime::program_fragments::Cell_write;
+use onchain_runtime::result_mode::ResultModeVerify;
+use onchain_runtime::state::StateValue;
 use rand::rngs::OsRng;
 use serialize::{tagged_deserialize, tagged_serialize};
 use std::collections::HashMap;
+use std::fs;
 use std::sync::Arc;
+use storage::arena::Sp;
 use storage::db::InMemoryDB;
 use tracing::{debug, info};
 use transient_crypto::commitment::PedersenRandomness;
 use transient_crypto::curve::Fr;
-use transient_crypto::proofs::{KeyLocation, ProvingKeyMaterial, Resolver as ResolverT, WrappedIr};
+use transient_crypto::proofs::{
+    KeyLocation, PARAMS_VERIFIER, Proof, ProvingKeyMaterial, Resolver as ResolverT, VerifierKey,
+    WrappedIr,
+};
+use transient_crypto::repr::FieldRepr;
 
 use zkir as zkir_v2;
+use zswap::Input;
+use zswap::ledger::State as ZswapLedgerState;
 use zswap::prove::ZswapResolver;
 
 use crate::versioned_ir;
@@ -99,6 +117,364 @@ pub(crate) async fn health() -> Result<web::Json<HealthResponse>, Error> {
         timestamp: time::OffsetDateTime::now_utc(),
     };
     Ok(web::Json(status))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SplitSpendRequest {
+    sk_commitment: String,
+    nullifier: String,
+    pk: String,
+    commitment_hash: String,
+    coin_value: u128,
+    coin_type: Option<String>,
+    coin_nonce: String,
+    mt_index: u64,
+    contract_address: Option<String>,
+    zswap_state: Option<String>,
+    zswap_state_file: Option<String>,
+    prove: Option<bool>,
+    client_derivation_proof: Option<String>,
+    proving_data: Option<SplitProvingData>,
+}
+
+#[derive(Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SplitProvingData {
+    prover_key: String,
+    verifier_key: String,
+    ir_source: String,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SplitSpendResponse {
+    status: SplitSpendStatus,
+    key_location: String,
+    inputs_count: usize,
+    public_transcript_inputs_count: usize,
+    first_input: String,
+    raw_secret_key_present: bool,
+    merkle_path_source: SplitMerklePathSource,
+    preimage_hex: String,
+    proof_hex: Option<String>,
+    proof_error: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum SplitMerklePathSource {
+    ZswapState,
+    ZswapStateFile,
+    SimulatedSingleLeaf,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum SplitSpendStatus {
+    PreimageBuilt,
+    ProofBuilt,
+    ProofUnavailable,
+}
+
+#[post("/v2/prove-split-spend")]
+pub(crate) async fn prove_split_spend(
+    pool: Data<Arc<WorkerPool>>,
+    request: web::Json<SplitSpendRequest>,
+) -> Result<web::Json<SplitSpendResponse>, Error> {
+    info!("Starting to process request for /v2/prove-split-spend...");
+
+    let sk_commitment = fr_from_hex(&request.sk_commitment)?;
+    let nullifier = Nullifier(HashOutput(bytes32_from_hex(&request.nullifier)?));
+    let pk = CoinPublicKey(HashOutput(bytes32_from_hex(&request.pk)?));
+    let commitment_hash = Commitment(HashOutput(bytes32_from_hex(&request.commitment_hash)?));
+    let nonce = coin_structure::coin::Nonce(HashOutput(bytes32_from_hex(&request.coin_nonce)?));
+    let contract_address = request
+        .contract_address
+        .as_deref()
+        .map(bytes32_from_hex)
+        .transpose()?
+        .map(|bytes| ContractAddress(HashOutput(bytes)));
+
+    let coin = QualifiedCoinInfo {
+        value: request.coin_value.into(),
+        type_: request
+            .coin_type
+            .as_deref()
+            .map(bytes32_from_hex)
+            .transpose()?
+            .map(|bytes| ShieldedTokenType(HashOutput(bytes)))
+            .unwrap_or_default(),
+        nonce,
+        mt_index: request.mt_index,
+    };
+    let (tree, merkle_path_source) = split_spend_tree(&request, commitment_hash)?;
+    if request.prove.unwrap_or(false)
+        && matches!(
+            &merkle_path_source,
+            SplitMerklePathSource::SimulatedSingleLeaf
+        )
+    {
+        return Err(ErrorBadRequest(
+            "split spend proof requests must include zswapState or zswapStateFile",
+        ));
+    }
+    if request.prove.unwrap_or(false) {
+        verify_client_derivation_proof(&request, sk_commitment, pk, commitment_hash, nullifier)
+            .await?;
+    }
+
+    let input = Input::new_split(
+        &mut OsRng,
+        &coin,
+        None,
+        nullifier,
+        commitment_hash,
+        sk_commitment,
+        contract_address,
+        &tree,
+    )
+    .map_err(|e| ErrorBadRequest(format!("build split spend preimage: {e:?}")))?;
+
+    let first_input = input
+        .proof
+        .inputs
+        .first()
+        .ok_or_else(|| ErrorBadRequest("split spend preimage had no inputs"))?;
+
+    let versioned_preimage = ProofPreimageVersioned::V2(input.proof.clone());
+    let mut preimage_bytes = Vec::new();
+    tagged_serialize(&versioned_preimage, &mut preimage_bytes)
+        .map_err(|e| ErrorBadRequest(format!("serialize split spend preimage: {e}")))?;
+
+    let (proof_hex, proof_error) = if request.prove.unwrap_or(false) {
+        let ppi = input.proof.clone();
+        let key_location = input.proof.key_location.clone();
+        let inline_data = request
+            .proving_data
+            .clone()
+            .map(TryInto::try_into)
+            .transpose()?;
+        let (_id, updates) = pool
+            .submit_and_subscribe(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async move {
+                    let inline_data_resolver = inline_data.clone();
+                    let resolver = Resolver::new(
+                        PUBLIC_PARAMS.clone(),
+                        DustResolver(
+                            MidnightDataProvider::new(
+                                FetchMode::OnDemand,
+                                OutputMode::Log,
+                                ledger::dust::DUST_EXPECTED_FILES.to_owned(),
+                            )
+                            .expect("data provider initialization failed"),
+                        ),
+                        Box::new(move |_: KeyLocation| {
+                            Box::pin(std::future::ready(Ok(inline_data_resolver.clone())))
+                        }),
+                    );
+                    let proving_data = match inline_data {
+                        Some(pkm) => pkm,
+                        None => resolver
+                            .resolve_key(key_location.clone())
+                            .await
+                            .map_err(|e| WorkError::BadInput(e.to_string()))?
+                            .ok_or_else(|| {
+                                WorkError::BadInput(format!(
+                                    "couldn't find split proving key {}",
+                                    &key_location.0
+                                ))
+                            })?,
+                    };
+
+                    let proof = versioned_ir::prove_split(ppi, proving_data, &resolver, 1)
+                        .await
+                        .map_err(WorkError::BadInput)?
+                        .0;
+
+                    let mut response = Vec::new();
+                    tagged_serialize(&ProofVersioned::V2(proof), &mut response)
+                        .map_err(|e| WorkError::InternalError(e.to_string()))?;
+                    Ok(response)
+                })
+            })
+            .await?;
+        match JobStatus::wait_for_success(&updates).await {
+            Ok(bytes) => (Some(bytes.encode_hex()), None),
+            Err(e) => (None, Some(work_error_message(e))),
+        }
+    } else {
+        (None, None)
+    };
+    let status = match (&proof_hex, &proof_error, request.prove.unwrap_or(false)) {
+        (Some(_), None, _) => SplitSpendStatus::ProofBuilt,
+        (None, Some(_), _) => SplitSpendStatus::ProofUnavailable,
+        _ => SplitSpendStatus::PreimageBuilt,
+    };
+
+    Ok(web::Json(SplitSpendResponse {
+        status,
+        key_location: input.proof.key_location.0.to_string(),
+        inputs_count: input.proof.inputs.len(),
+        public_transcript_inputs_count: input.proof.public_transcript_inputs.len(),
+        first_input: first_input.0.to_bytes_le().encode_hex(),
+        raw_secret_key_present: false,
+        merkle_path_source,
+        preimage_hex: preimage_bytes.encode_hex(),
+        proof_hex,
+        proof_error,
+    }))
+}
+
+fn split_spend_tree(
+    request: &SplitSpendRequest,
+    commitment_hash: Commitment,
+) -> Result<
+    (
+        transient_crypto::merkle_tree::MerkleTree<
+            Option<storage::arena::Sp<ContractAddress, InMemoryDB>>,
+            InMemoryDB,
+        >,
+        SplitMerklePathSource,
+    ),
+    Error,
+> {
+    if let Some(zswap_state) = &request.zswap_state {
+        return Ok((
+            zswap_state_from_hex(zswap_state)?.coin_coms.rehash(),
+            SplitMerklePathSource::ZswapState,
+        ));
+    }
+
+    let zswap_state_file = request
+        .zswap_state_file
+        .clone()
+        .or_else(|| std::env::var("MIDNIGHT_PROOF_SERVER_ZSWAP_STATE_FILE").ok());
+    if let Some(path) = zswap_state_file {
+        let zswap_state = fs::read_to_string(path)
+            .map_err(|e| ErrorBadRequest(format!("read zswap state file: {e}")))?;
+        return Ok((
+            zswap_state_from_hex(zswap_state.trim())?.coin_coms.rehash(),
+            SplitMerklePathSource::ZswapStateFile,
+        ));
+    }
+
+    let tree = transient_crypto::merkle_tree::MerkleTree::blank(zswap::ZSWAP_TREE_HEIGHT)
+        .try_update_hash(request.mt_index, commitment_hash.0, None)
+        .map_err(|e| ErrorBadRequest(format!("invalid Merkle tree update: {e:?}")))?
+        .rehash();
+    Ok((tree, SplitMerklePathSource::SimulatedSingleLeaf))
+}
+
+fn zswap_state_from_hex(value: &str) -> Result<ZswapLedgerState<InMemoryDB>, Error> {
+    let bytes = bytes_from_hex(value)?;
+    tagged_deserialize(&bytes[..])
+        .map_err(|e| ErrorBadRequest(format!("deserialize zswap state: {e}")))
+}
+
+async fn verify_client_derivation_proof(
+    request: &SplitSpendRequest,
+    sk_commitment: Fr,
+    pk: CoinPublicKey,
+    commitment_hash: Commitment,
+    nullifier: Nullifier,
+) -> Result<(), Error> {
+    let proof_hex = request.client_derivation_proof.as_ref().ok_or_else(|| {
+        ErrorBadRequest("split spend proof requests require clientDerivationProof")
+    })?;
+    let proof = Proof(bytes_from_hex(proof_hex)?);
+    let verifier_key: VerifierKey = tagged_deserialize(
+        &include_bytes!("../../../../circuits/static/client-derivation/sk_prove.verifier")[..],
+    )
+    .map_err(|e| ErrorBadRequest(format!("deserialize client derivation verifier key: {e}")))?;
+    let mut statement = vec![Fr::from(0u64)];
+    statement.extend(client_derivation_public_transcript_inputs(
+        sk_commitment,
+        pk,
+        commitment_hash.0.0,
+        nullifier.0.0,
+    ));
+    verifier_key
+        .verify(&PARAMS_VERIFIER, &proof, statement.into_iter())
+        .map_err(|e| ErrorBadRequest(format!("invalid client derivation proof: {e}")))
+}
+
+fn client_derivation_public_transcript_inputs(
+    sk_commitment: Fr,
+    pk: CoinPublicKey,
+    commitment_hash: [u8; 32],
+    nullifier: [u8; 32],
+) -> Vec<Fr> {
+    let mut inputs = Vec::new();
+    extend_ops(
+        &mut inputs,
+        Cell_write!([Key::Value(0u8.into())], false, Fr, sk_commitment),
+    );
+    extend_ops(
+        &mut inputs,
+        Cell_write!([Key::Value(1u8.into())], false, CoinPublicKey, pk),
+    );
+    extend_ops(
+        &mut inputs,
+        Cell_write!([Key::Value(2u8.into())], false, [u8; 32], commitment_hash),
+    );
+    extend_ops(
+        &mut inputs,
+        Cell_write!([Key::Value(3u8.into())], false, [u8; 32], nullifier),
+    );
+    inputs
+}
+
+fn extend_ops<const N: usize>(inputs: &mut Vec<Fr>, ops: [Op<ResultModeVerify, InMemoryDB>; N]) {
+    for op in ops.into_iter().filter(|op| match op {
+        Op::Idx { path, .. } => !path.is_empty(),
+        Op::Ins { n, .. } => *n != 0,
+        _ => true,
+    }) {
+        op.field_repr(inputs);
+    }
+}
+
+impl TryFrom<SplitProvingData> for ProvingKeyMaterial {
+    type Error = Error;
+
+    fn try_from(value: SplitProvingData) -> Result<Self, Self::Error> {
+        Ok(ProvingKeyMaterial {
+            prover_key: bytes_from_hex(&value.prover_key)?,
+            verifier_key: bytes_from_hex(&value.verifier_key)?,
+            ir_source: bytes_from_hex(&value.ir_source)?,
+        })
+    }
+}
+
+fn bytes32_from_hex(value: &str) -> Result<[u8; 32], Error> {
+    let value = value.strip_prefix("0x").unwrap_or(value);
+    let bytes = bytes_from_hex(value)?;
+    bytes.try_into().map_err(|bytes: Vec<u8>| {
+        ErrorBadRequest(format!("expected 32 bytes, got {}", bytes.len()))
+    })
+}
+
+fn bytes_from_hex(value: &str) -> Result<Vec<u8>, Error> {
+    let value = value.strip_prefix("0x").unwrap_or(value);
+    hex::decode(value).map_err(|e| ErrorBadRequest(format!("invalid hex: {e}")))
+}
+
+fn work_error_message(error: WorkError) -> String {
+    match error {
+        WorkError::BadInput(message) | WorkError::InternalError(message) => message,
+        WorkError::CancelledUnexpectedly => "work cancelled unexpectedly".to_string(),
+        WorkError::JoinError => "task join error".to_string(),
+    }
+}
+
+fn fr_from_hex(value: &str) -> Result<Fr, Error> {
+    let bytes = bytes32_from_hex(value)?;
+    Fr::from_le_bytes(&bytes).ok_or_else(|| ErrorBadRequest("invalid field element"))
 }
 
 #[derive(Clone, Copy, serde::Serialize, PartialEq)]
@@ -185,6 +561,7 @@ pub(crate) async fn check(
     let (_id, updates) = pool
         .submit_and_subscribe(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
                 .build()
                 .unwrap();
             rt.block_on(async move {
@@ -341,6 +718,7 @@ pub(crate) async fn prove_transaction(
     let (_id, updates) = pool
         .submit_and_subscribe(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
                 .build()
                 .unwrap();
             rt.block_on(async move {

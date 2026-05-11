@@ -41,8 +41,8 @@ use storage::storage::default_storage;
 use transient_crypto::commitment::Pedersen;
 use transient_crypto::curve::{EmbeddedFr, Fr};
 use transient_crypto::encryption;
-use transient_crypto::hash::transient_commit;
-use transient_crypto::merkle_tree::MerkleTree;
+use transient_crypto::hash::{degrade_to_transient, transient_commit, transient_hash};
+use transient_crypto::merkle_tree::{MerklePath, MerkleTree, MerkleTreeDigest};
 use transient_crypto::proofs::{KeyLocation, ProofPreimage};
 use transient_crypto::repr::FieldRepr;
 
@@ -91,6 +91,7 @@ impl AuthorizedClaim<ProofPreimage> {
         let public_transcript_prog: &[Op<ResultModeVerify, D>] =
             &Cell_write!([Key::Value(4u8.into())], false, CoinPublicKey, pk);
         let mut inputs = Vec::new();
+        pk.field_repr(&mut inputs);
         inputs.push(sk_commitment);
         let mut public_transcript_inputs = Vec::new();
         for op in filter_invalid(public_transcript_prog.iter().cloned()) {
@@ -315,11 +316,16 @@ impl<D: DB> Input<ProofPreimage, D> {
         ));
         let mut inputs = Vec::new();
         inputs.push(sk_commitment);
-        tree.path_for_leaf(coin.mt_index, ((), commitment_hash))
-            .map_err(OfferCreationFailed::InvalidIndex)?
-            .field_repr(&mut inputs);
+        let path = tree
+            .path_for_leaf(coin.mt_index, ((), commitment_hash))
+            .map_err(OfferCreationFailed::InvalidIndex)?;
+        if raw_leaf_hash_root(commitment_hash.0, &path) != merkle_tree_root {
+            return Err(OfferCreationFailed::CommitmentNotInTree);
+        }
+        path.field_repr(&mut inputs);
         CoinInfo::from(coin).field_repr(&mut inputs);
         inputs.push(rc);
+        nullifier.field_repr(&mut inputs);
         let mut public_transcript_inputs = Vec::new();
         for op in filter_invalid(public_transcript_prog.into_iter()) {
             op.field_repr(&mut public_transcript_inputs);
@@ -342,6 +348,22 @@ impl<D: DB> Input<ProofPreimage, D> {
         };
         Ok(inp)
     }
+}
+
+fn raw_leaf_hash_root<T>(
+    leaf_hash: transient_crypto::hash::HashOutput,
+    path: &MerklePath<T>,
+) -> MerkleTreeDigest {
+    MerkleTreeDigest(path.path.iter().fold(
+        degrade_to_transient(leaf_hash),
+        |acc, entry| {
+            if entry.goes_left {
+                transient_hash(&[acc, entry.sibling.0])
+            } else {
+                transient_hash(&[entry.sibling.0, acc])
+            }
+        },
+    ))
 }
 
 impl<D: DB> Output<ProofPreimage, D> {

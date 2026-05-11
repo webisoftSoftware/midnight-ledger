@@ -501,6 +501,132 @@ mod prove_tx_endpoint {
     }
 }
 
+mod split_spend_endpoint {
+    use super::common::*;
+    use coin_structure::coin;
+    use coin_structure::transfer::{Recipient, SenderEvidence};
+    use midnight_proof_server::preview_client::{
+        PreviewSplitProveOptions, PreviewWalletSpend, build_split_spend_handoff,
+        prove_preview_wallet_split_spend,
+    };
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
+    use std::borrow::Cow;
+    use std::env;
+    use storage::db::InMemoryDB;
+    use storage::storage::HashMap;
+    use zswap::keys::SecretKeys;
+    use zswap::ledger::State as ZswapLedgerState;
+
+    fn synthetic_wallet_spend() -> PreviewWalletSpend {
+        let mut rng = StdRng::seed_from_u64(0x51504c4954);
+        let key = SecretKeys::from_rng_seed(&mut rng);
+        let coin = coin::Info::new(&mut rng, 100, Default::default());
+        let commitment = coin.commitment(&Recipient::User(key.coin_public_key()));
+        let nullifier = coin.nullifier(&SenderEvidence::User(Cow::Borrowed(&key.coin_secret_key)));
+        let mut zswap_state = ZswapLedgerState::<InMemoryDB>::new();
+        zswap_state.coin_coms = zswap_state
+            .coin_coms
+            .try_update_hash(0, commitment.0, None)
+            .expect("synthetic commitment should fit in zswap tree")
+            .rehash();
+        zswap_state.coin_coms_set = HashMap::new().insert(commitment, ());
+        zswap_state.first_free = 1;
+
+        PreviewWalletSpend {
+            key_index: 0,
+            key,
+            coin,
+            commitment,
+            nullifier,
+            mt_index: 0,
+            zswap_state,
+        }
+    }
+
+    #[tokio::test]
+    async fn synthetic_client_derivation_proof_is_verified_before_split_proving() {
+        let server = start_server(DEFAULT_NUM_WORKERS, DEFAULT_JOB_LIMIT);
+        let spend = synthetic_wallet_spend();
+        let handoff = build_split_spend_handoff(&spend)
+            .await
+            .expect("client handoff should include derivation proof");
+
+        assert!(handoff["pk"].as_str().is_some());
+        assert!(handoff["clientDerivationProof"].as_str().is_some());
+
+        let response = build_client(180)
+            .post(format!("{}/v2/prove-split-spend", server.base_url()))
+            .json(&handoff)
+            .send()
+            .await
+            .expect("split spend request failed");
+
+        let status = response.status();
+        let body: serde_json::Value = response.json().await.expect("split response JSON");
+        assert_eq!(status, 200, "unexpected split response: {body}");
+        assert_eq!(body["status"], "proofBuilt");
+        assert_eq!(body["merklePathSource"], "zswapState");
+        assert!(body["proofError"].is_null());
+        assert!(
+            body["proofHex"]
+                .as_str()
+                .expect("proofHex should be present")
+                .len()
+                > 64
+        );
+
+        stop_server(server).await;
+    }
+
+    #[tokio::test]
+    async fn preview_wallet_proves_real_unspent_split_spend() {
+        if env::var("MIDNIGHT_RUN_PREVIEW_E2E").as_deref() != Ok("1") {
+            eprintln!(
+                "skipping live preview e2e; set MIDNIGHT_RUN_PREVIEW_E2E=1 with preview wallet env"
+            );
+            return;
+        }
+
+        let server = start_server(DEFAULT_NUM_WORKERS, DEFAULT_JOB_LIMIT);
+        let base_url = server.base_url();
+        let request_timeout_secs = env::var("MIDNIGHT_PREVIEW_REQUEST_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(180);
+        let result = prove_preview_wallet_split_spend(PreviewSplitProveOptions {
+            proof_server_url: &base_url,
+            event_limit: None,
+            request_timeout_secs,
+        })
+        .await;
+
+        stop_server(server).await;
+
+        let report = result.expect("preview split prove must succeed");
+        eprintln!(
+            "proved preview output key_index={key_index} mt_index={mt_index} value={} token={} status={} proof_len={}",
+            report.coin_value,
+            report.token_type_hex,
+            report.response["status"],
+            report.proof_hex_len,
+            key_index = report.key_index,
+            mt_index = report.mt_index,
+        );
+        assert_eq!(report.response["status"], "proofBuilt");
+        assert_eq!(report.response["merklePathSource"], "zswapState");
+        assert_eq!(report.status, "proofBuilt");
+        assert!(
+            report.response["proofHex"]
+                .as_str()
+                .expect("proofHex")
+                .len()
+                > 64
+        );
+        assert!(report.response["proofError"].is_null());
+    }
+}
+
 mod ready_endpoint {
     use super::common::*;
     use super::test_data::*;

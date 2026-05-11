@@ -85,6 +85,27 @@ pub const ZSWAP_EXPECTED_FILES: &[(&str, [u8; 32], &str)] = &[
         "zero-knowledge verifying key for Zswap signing operations"
     ),
     exptfile!("sign.bzkir", "ZKIR source for Zswap signing operations"),
+    exptfile!(
+        "spend-split.prover",
+        "zero-knowledge proving key for split Zswap inputs"
+    ),
+    exptfile!(
+        "spend-split.verifier",
+        "zero-knowledge verifying key for split Zswap inputs"
+    ),
+    exptfile!("spend-split.bzkir", "ZKIR source for split Zswap inputs"),
+    exptfile!(
+        "sign-split.prover",
+        "zero-knowledge proving key for split Zswap signing operations"
+    ),
+    exptfile!(
+        "sign-split.verifier",
+        "zero-knowledge verifying key for split Zswap signing operations"
+    ),
+    exptfile!(
+        "sign-split.bzkir",
+        "ZKIR source for split Zswap signing operations"
+    ),
 ];
 
 pub(crate) const COIN_CIPHERTEXT_LEN: usize = 6;

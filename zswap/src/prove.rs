@@ -33,6 +33,23 @@ pub struct ZswapResolver(pub MidnightDataProvider);
 
 impl Resolver for ZswapResolver {
     async fn resolve_key(&self, key: KeyLocation) -> std::io::Result<Option<ProvingKeyMaterial>> {
+        match &*key.0 {
+            "midnight/zswap/spend-split" => {
+                return Ok(Some(ProvingKeyMaterial {
+                    prover_key: include_bytes!("../static/spend-split.prover").to_vec(),
+                    verifier_key: include_bytes!("../static/spend-split.verifier").to_vec(),
+                    ir_source: include_bytes!("../static/spend-split.bzkir").to_vec(),
+                }));
+            }
+            "midnight/zswap/sign-split" => {
+                return Ok(Some(ProvingKeyMaterial {
+                    prover_key: include_bytes!("../static/sign-split.prover").to_vec(),
+                    verifier_key: include_bytes!("../static/sign-split.verifier").to_vec(),
+                    ir_source: include_bytes!("../static/sign-split.bzkir").to_vec(),
+                }));
+            }
+            _ => {}
+        }
         let file_root = match &*key.0 {
             "midnight/zswap/spend" => {
                 concat!("zswap/", midnight_ledger_static::version!(), "/spend")

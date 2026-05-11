@@ -5,6 +5,10 @@ license.workspace = true
 version.workspace = true
 publish = false
 
+[[bin]]
+name = "preview-split-prove"
+path = "src/bin/preview_split_prove.rs"
+
 [features]
 default = []
 experimental = ["dep:zkir-v3"]
@@ -13,6 +17,8 @@ experimental = ["dep:zkir-v3"]
 ledger = { path = "../ledger", package = "midnight-ledger", default-features = false, features = ["proving"] }
 zswap = { path = "../zswap", package = "midnight-zswap" }
 base-crypto = { path = "../base-crypto", package = "midnight-base-crypto" }
+coin-structure = { path = "../coin-structure", package = "midnight-coin-structure" }
+onchain-runtime = { path = "../onchain-runtime", package = "midnight-onchain-runtime" }
 transient-crypto = { path = "../transient-crypto", package = "midnight-transient-crypto" }
 storage = { path = "../storage", package = "midnight-storage" }
 serialize = { path = "../serialize", package = "midnight-serialize" }
@@ -40,10 +46,11 @@ tokio = "1.46.1"
 async-channel = "2.5.0"
 time = { version = "0.3.47", features = ["serde-human-readable"] }
 serde = "1.0.219"
+serde_json = "1.0.140"
+reqwest = { version = "^0.13.0", default-features = false, features = ["json", "rustls"] }
 
 [dev-dependencies]
 ledger = { path = "../ledger", package = "midnight-ledger", features = ["test-utilities", "proving"] }
-coin-structure = { path = "../coin-structure", package = "midnight-coin-structure" }
 onchain-runtime = { path = "../onchain-runtime", package = "midnight-onchain-runtime" }
 transient-crypto = { path = "../transient-crypto", package = "midnight-transient-crypto" }
 env_logger = "^0.11"

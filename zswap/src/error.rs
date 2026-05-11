@@ -16,7 +16,7 @@ use coin_structure::coin::{Commitment, Nullifier};
 use coin_structure::contract::ContractAddress;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
-use transient_crypto::merkle_tree::{InvalidIndex, MerkleTreeDigest};
+use transient_crypto::merkle_tree::{InvalidIndex, InvalidUpdate, MerkleTreeDigest};
 use transient_crypto::proofs::{ProvingError, VerifyingError};
 
 #[derive(Debug, Clone, Copy)]
@@ -83,6 +83,8 @@ pub enum OfferCreationFailed {
     Proving(ProvingError),
     NotContractOwned,
     TreeNotRehashed,
+    CommitmentNotInTree,
+    MerkleTreeError(InvalidUpdate),
 }
 
 impl Display for OfferCreationFailed {
@@ -99,6 +101,11 @@ impl Display for OfferCreationFailed {
                 formatter,
                 "attempted to spend from a Merkle tree that was not rehashed"
             ),
+            CommitmentNotInTree => write!(
+                formatter,
+                "split spend commitment did not match the Merkle tree root"
+            ),
+            MerkleTreeError(msg) => write!(formatter, "merkle tree error: {msg}"),
         }
     }
 }
