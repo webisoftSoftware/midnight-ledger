@@ -59,7 +59,11 @@ const OUTPUT_VK_RAW: &[u8] = include_bytes!("../static/output.verifier");
 #[cfg(feature = "proof-verifying")]
 const SPEND_VK_RAW: &[u8] = include_bytes!("../static/spend.verifier");
 #[cfg(feature = "proof-verifying")]
+const SPEND_SPLIT_VK_RAW: &[u8] = include_bytes!("../static/spend-split.verifier");
+#[cfg(feature = "proof-verifying")]
 const SIGN_VK_RAW: &[u8] = include_bytes!("../static/sign.verifier");
+#[cfg(feature = "proof-verifying")]
+const SIGN_SPLIT_VK_RAW: &[u8] = include_bytes!("../static/sign-split.verifier");
 
 #[cfg(feature = "proof-verifying")]
 lazy_static! {
@@ -69,8 +73,14 @@ lazy_static! {
     pub static ref SPEND_VK: VerifierKey =
         tagged_deserialize(&mut SPEND_VK_RAW.to_vec().as_slice())
             .expect("Zswap Spend VK should be valid");
+    pub static ref SPEND_SPLIT_VK: VerifierKey =
+        tagged_deserialize(&mut SPEND_SPLIT_VK_RAW.to_vec().as_slice())
+            .expect("Zswap Split Spend VK should be valid");
     pub static ref SIGN_VK: VerifierKey = tagged_deserialize(&mut SIGN_VK_RAW.to_vec().as_slice())
         .expect("Zswap Sign VK should be valid");
+    pub static ref SIGN_SPLIT_VK: VerifierKey =
+        tagged_deserialize(&mut SIGN_SPLIT_VK_RAW.to_vec().as_slice())
+            .expect("Zswap Split Sign VK should be valid");
 }
 
 #[cfg(feature = "proof-verifying")]
@@ -137,8 +147,14 @@ impl AuthorizedClaim<Proof> {
         for op in filter_invalid(prog.iter().cloned()) {
             op.field_repr(&mut statement);
         }
-        SIGN_VK
-            .verify(&PARAMS_VERIFIER, &self.proof, statement.into_iter())
+        if SIGN_VK
+            .verify(&PARAMS_VERIFIER, &self.proof, statement.iter().copied())
+            .is_ok()
+        {
+            return Ok(());
+        }
+        SIGN_SPLIT_VK
+            .verify(&PARAMS_VERIFIER, &self.proof, statement.iter().copied())
             .map_err(MalformedOffer::InvalidProof)
     }
 }
@@ -186,8 +202,55 @@ impl<D: DB> Input<Proof, D> {
         for op in with_outputs(prog.into_iter(), [true.into(), segment.into()].into_iter()) {
             op.field_repr(&mut statement);
         }
-        SPEND_VK
-            .verify(&PARAMS_VERIFIER, &self.proof, statement.into_iter())
+        if SPEND_VK
+            .verify(&PARAMS_VERIFIER, &self.proof, statement.iter().copied())
+            .is_ok()
+        {
+            return Ok(());
+        }
+
+        let mut split_prog = Vec::new();
+        split_prog.extend::<[Op<ResultModeGather, InMemoryDB>; 6]>(HistoricMerkleTree_check_root!(
+            [Key::Value(0u8.into())],
+            false,
+            32,
+            [u8; 32],
+            self.merkle_tree_root
+        ));
+        split_prog.extend(Set_insert!(
+            [Key::Value(1u8.into())],
+            false,
+            [u8; 32],
+            self.nullifier
+        ));
+        if let Some(addr) = &self.contract_address {
+            split_prog.extend(Cell_write!(
+                [Key::Value(3u8.into())],
+                false,
+                ContractAddress,
+                *addr.deref()
+            ));
+        }
+        split_prog.extend(Cell_read!([Key::Value(5u8.into())], false, u16));
+        split_prog.extend(Cell_write!(
+            [Key::Value(2u8.into())],
+            false,
+            (Fr, Fr),
+            self.value_commitment.0
+        ));
+        let mut split_statement = vec![0.into()];
+        for op in with_outputs(
+            split_prog.into_iter(),
+            [true.into(), segment.into()].into_iter(),
+        ) {
+            op.field_repr(&mut split_statement);
+        }
+        SPEND_SPLIT_VK
+            .verify(
+                &PARAMS_VERIFIER,
+                &self.proof,
+                split_statement.iter().copied(),
+            )
             .map_err(MalformedOffer::InvalidProof)
     }
 }
