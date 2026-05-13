@@ -6,6 +6,7 @@ use base_crypto::data_provider::{FetchMode, MidnightDataProvider, OutputMode};
 use coin_structure::coin::{Commitment, Info as CoinInfo, Nullifier, PublicKey as CoinPublicKey};
 use coin_structure::transfer::SenderEvidence;
 use ledger::events::{Event, EventDetails};
+use ledger::structure::{ProofMarker, StandardTransaction, Transaction};
 use onchain_runtime::ops::{Key, Op};
 use onchain_runtime::program_fragments::Cell_write;
 use onchain_runtime::result_mode::ResultModeVerify;
@@ -13,7 +14,7 @@ use onchain_runtime::state::StateValue;
 use rand::Rng;
 use rand::rngs::OsRng;
 use serde_json::json;
-use serialize::{tagged_deserialize, tagged_serialize};
+use serialize::{Deserializable, Tagged, tagged_deserialize, tagged_serialize};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
@@ -22,15 +23,21 @@ use std::process::Command;
 use std::time::Duration;
 use storage::arena::Sp;
 use storage::db::InMemoryDB;
+use storage::storage::HashMap as StorageHashMap;
+use transient_crypto::commitment::{PedersenRandomness, PureGeneratorPedersen};
 use transient_crypto::curve::Fr;
+use transient_crypto::encryption;
 use transient_crypto::hash::transient_hash;
 use transient_crypto::proofs::{
-    KeyLocation, ParamsProver, ParamsProverProvider, ProofPreimage, ProvingKeyMaterial, Resolver,
+    KeyLocation, ParamsProver, ParamsProverProvider, Proof, ProofPreimage, ProvingKeyMaterial,
+    Resolver,
 };
-use transient_crypto::repr::FieldRepr;
+use transient_crypto::repr::{FieldRepr, FromFieldRepr};
+use zkir::LocalProvingProvider;
 use zswap::keys::{SecretKeys, Seed};
 use zswap::ledger::State as ZswapLedgerState;
 use zswap::prove::ZswapResolver;
+use zswap::{Delta, Input, Offer as ZswapOffer, Output as ZswapOutput};
 
 pub type PreviewResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 const CLIENT_DERIVATION_KEY_LOCATION: &str = "split/client/sk-derivation";
@@ -47,9 +54,17 @@ pub struct PreviewSplitProveReport {
     pub mt_index: u64,
     pub coin_value: String,
     pub token_type_hex: String,
+    pub recipient_shielded_address: String,
     pub status: String,
     pub proof_hex_len: usize,
+    pub tx_hash: String,
+    pub tx_id: Option<String>,
+    pub tx_hex_len: usize,
+    pub block_hash: String,
+    pub inclusion_status: String,
+    pub well_formed: String,
     pub response: serde_json::Value,
+    pub submission: serde_json::Value,
 }
 
 pub struct PreviewWalletSpend {
@@ -80,6 +95,15 @@ pub async fn prove_preview_wallet_split_spend(
         options.request_timeout_secs,
     )
     .await?;
+    let recipient = decode_preview_recipient(&env)?;
+    let submission = submit_split_send_transaction(
+        &env,
+        options.proof_server_url,
+        &wallet_spend,
+        &body,
+        &recipient,
+    )
+    .await?;
 
     let proof_hex_len = body["proofHex"].as_str().map(str::len).unwrap_or_default();
     Ok(PreviewSplitProveReport {
@@ -87,9 +111,32 @@ pub async fn prove_preview_wallet_split_spend(
         mt_index: wallet_spend.mt_index,
         coin_value: wallet_spend.coin.value.to_string(),
         token_type_hex: hex::encode(wallet_spend.coin.type_.0.0),
+        recipient_shielded_address: recipient.address,
         status: body["status"].as_str().unwrap_or_default().to_string(),
         proof_hex_len,
+        tx_hash: submission["txHash"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+        tx_id: submission["txId"].as_str().map(str::to_string),
+        tx_hex_len: submission["balancedTxHex"]
+            .as_str()
+            .map(str::len)
+            .unwrap_or_default(),
+        block_hash: submission["blockHash"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+        inclusion_status: submission["inclusionStatus"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+        well_formed: submission["wellFormed"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
         response: body,
+        submission,
     })
 }
 
@@ -220,6 +267,214 @@ async fn post_split_spend_handoff(
     Ok(body)
 }
 
+struct PreviewRecipient {
+    address: String,
+    coin_public_key: CoinPublicKey,
+    encryption_public_key: encryption::PublicKey,
+}
+
+fn decode_preview_recipient(env: &HashMap<String, String>) -> PreviewResult<PreviewRecipient> {
+    let address = env_value(env, "MIDNIGHT_PREVIEW_RECIPIENT_SHIELDED_ADDRESS");
+    if address.trim().is_empty() {
+        return Err("set MIDNIGHT_PREVIEW_RECIPIENT_SHIELDED_ADDRESS for split-send e2e".into());
+    }
+    let network_id = env_value_or(env, "MIDNIGHT_PREVIEW_NETWORK_ID", "preview");
+    let output = Command::new("node")
+        .arg(repo_root_tool(
+            "tools/decode_midnight_shielded_address.mjs",
+        )?)
+        .arg("--address")
+        .arg(address.trim())
+        .arg("--network-id")
+        .arg(&network_id)
+        .envs(env.iter())
+        .output()?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "decode recipient shielded address failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+
+    let decoded: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let coin_public_key = deserialize_hex(
+        decoded["coinPublicKey"]
+            .as_str()
+            .ok_or("decoded recipient missing coinPublicKey")?,
+    )?;
+    let encryption_public_key = deserialize_hex(
+        decoded["encryptionPublicKey"]
+            .as_str()
+            .ok_or("decoded recipient missing encryptionPublicKey")?,
+    )?;
+
+    Ok(PreviewRecipient {
+        address: address.trim().to_string(),
+        coin_public_key,
+        encryption_public_key,
+    })
+}
+
+async fn submit_split_send_transaction(
+    env: &HashMap<String, String>,
+    proof_server_url: &str,
+    spend: &PreviewWalletSpend,
+    split_response: &serde_json::Value,
+    recipient: &PreviewRecipient,
+) -> PreviewResult<serde_json::Value> {
+    if env_value(env, "MIDNIGHT_PREVIEW_RECOVERY_PHRASE")
+        .trim()
+        .is_empty()
+    {
+        return Err(
+            "set MIDNIGHT_PREVIEW_RECOVERY_PHRASE for full split-send e2e submission".into(),
+        );
+    }
+
+    let input_preimage_hex = split_response["inputPreimageHex"]
+        .as_str()
+        .ok_or("split response missing inputPreimageHex")?;
+    let proved_input_hex = split_response["provedInputHex"]
+        .as_str()
+        .ok_or("split response missing provedInputHex")?;
+    let input_preimage: Input<ProofPreimage, InMemoryDB> =
+        deserialize_tagged_hex(input_preimage_hex)?;
+    let proved_input: Input<Proof, InMemoryDB> = deserialize_tagged_hex(proved_input_hex)?;
+    let output_preimage = ZswapOutput::new(
+        &mut OsRng,
+        &spend.coin,
+        None,
+        &recipient.coin_public_key,
+        Some(recipient.encryption_public_key),
+    )?;
+    let output_proof = prove_zswap_output(&output_preimage).await?;
+    proved_input
+        .well_formed(0)
+        .map_err(|e| format!("server split input proof is not well formed: {e}"))?;
+    output_proof
+        .well_formed(0)
+        .map_err(|e| format!("recipient output proof is not well formed: {e}"))?;
+
+    let deltas = [
+        Delta {
+            token_type: spend.coin.type_,
+            value: spend.coin.value.try_into().unwrap_or(i128::MAX),
+        },
+        output_preimage.delta(),
+    ]
+    .into_iter()
+    .collect();
+    let binding_randomness =
+        split_input_binding_randomness(&input_preimage)? + output_preimage.binding_randomness();
+    let mut unproven_offer = ZswapOffer {
+        inputs: vec![input_preimage].into(),
+        outputs: vec![output_preimage].into(),
+        transient: vec![].into(),
+        deltas,
+    };
+    unproven_offer.normalize();
+
+    let mut proven_offer = ZswapOffer {
+        inputs: vec![proved_input].into(),
+        outputs: vec![output_proof].into(),
+        transient: vec![].into(),
+        deltas: unproven_offer.deltas.clone(),
+    };
+    proven_offer.normalize();
+
+    let tx: Transaction<
+        base_crypto::signatures::Signature,
+        ProofMarker,
+        PedersenRandomness,
+        InMemoryDB,
+    > = Transaction::Standard(StandardTransaction {
+        network_id: env_value_or(env, "MIDNIGHT_PREVIEW_NETWORK_ID", "preview"),
+        intents: StorageHashMap::new(),
+        guaranteed_coins: Some(Sp::new(proven_offer)),
+        fallible_coins: StorageHashMap::new(),
+        binding_randomness,
+    });
+    let sealed: Transaction<
+        base_crypto::signatures::Signature,
+        ProofMarker,
+        PureGeneratorPedersen,
+        InMemoryDB,
+    > = tx.seal(OsRng);
+    let mut tx_bytes = Vec::new();
+    tagged_serialize(&sealed, &mut tx_bytes)?;
+    let tx_hex = hex::encode(tx_bytes);
+
+    let output = Command::new("node")
+        .arg(repo_root_tool("tools/preview_balance_submit_split_tx.mjs")?)
+        .arg("--tx-hex")
+        .arg(tx_hex)
+        .arg("--key-index")
+        .arg(spend.key_index.to_string())
+        .arg("--proof-server-url")
+        .arg(proof_server_url)
+        .arg("--submit")
+        .envs(env.iter())
+        .output()?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "split-send balance/submit failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+
+    Ok(serde_json::from_slice(&output.stdout)?)
+}
+
+async fn prove_zswap_output(
+    output: &ZswapOutput<ProofPreimage, InMemoryDB>,
+) -> PreviewResult<ZswapOutput<Proof, InMemoryDB>> {
+    let resolver = ZswapResolver(
+        MidnightDataProvider::new(
+            FetchMode::OnDemand,
+            OutputMode::Log,
+            zswap::ZSWAP_EXPECTED_FILES.to_vec(),
+        )
+        .map_err(|e| format!("data provider initialization failed: {e}"))?,
+    );
+    let provider = LocalProvingProvider {
+        rng: OsRng,
+        params: &resolver,
+        resolver: &resolver,
+    };
+    output
+        .prove(provider)
+        .await
+        .map_err(|e| format!("zswap recipient output proof failed: {e}").into())
+}
+
+fn deserialize_tagged_hex<T: Deserializable + Tagged>(value: &str) -> PreviewResult<T> {
+    let bytes = hex::decode(value.trim().trim_start_matches("0x"))?;
+    Ok(tagged_deserialize(&bytes[..])?)
+}
+
+fn deserialize_hex<T: Deserializable>(value: &str) -> PreviewResult<T> {
+    let bytes = hex::decode(value.trim().trim_start_matches("0x"))?;
+    Ok(T::deserialize(&mut &bytes[..], 0)?)
+}
+
+fn split_input_binding_randomness(
+    input: &Input<ProofPreimage, InMemoryDB>,
+) -> PreviewResult<PedersenRandomness> {
+    let rc_index = input
+        .proof
+        .inputs
+        .len()
+        .checked_sub(1 + Nullifier::FIELD_SIZE)
+        .ok_or("split input preimage is too short to contain binding randomness")?;
+    input.proof.inputs[rc_index]
+        .try_into()
+        .map_err(|_| "split input binding randomness is invalid".into())
+}
+
 pub fn preview_env() -> HashMap<String, String> {
     let mut values = HashMap::new();
     for (key, value) in std::env::vars() {
@@ -239,6 +494,15 @@ pub fn preview_env() -> HashMap<String, String> {
 
 fn env_value(env: &HashMap<String, String>, key: &str) -> String {
     env.get(key).cloned().unwrap_or_default()
+}
+
+fn env_value_or(env: &HashMap<String, String>, key: &str, default: &str) -> String {
+    let value = env_value(env, key);
+    if value.trim().is_empty() {
+        default.to_string()
+    } else {
+        value
+    }
 }
 
 fn fetch_preview_zswap_events(

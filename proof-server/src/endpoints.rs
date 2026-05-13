@@ -51,8 +51,8 @@ use tracing::{debug, info};
 use transient_crypto::commitment::PedersenRandomness;
 use transient_crypto::curve::Fr;
 use transient_crypto::proofs::{
-    KeyLocation, PARAMS_VERIFIER, Proof, ProvingKeyMaterial, Resolver as ResolverT, VerifierKey,
-    WrappedIr,
+    KeyLocation, PARAMS_VERIFIER, Proof, ProvingKeyMaterial, ProvingProvider,
+    Resolver as ResolverT, VerifierKey, WrappedIr,
 };
 use transient_crypto::repr::FieldRepr;
 
@@ -157,7 +157,9 @@ pub(crate) struct SplitSpendResponse {
     raw_secret_key_present: bool,
     merkle_path_source: SplitMerklePathSource,
     preimage_hex: String,
+    input_preimage_hex: String,
     proof_hex: Option<String>,
+    proved_input_hex: Option<String>,
     proof_error: Option<String>,
 }
 
@@ -246,10 +248,12 @@ pub(crate) async fn prove_split_spend(
     let mut preimage_bytes = Vec::new();
     tagged_serialize(&versioned_preimage, &mut preimage_bytes)
         .map_err(|e| ErrorBadRequest(format!("serialize split spend preimage: {e}")))?;
+    let mut input_preimage_bytes = Vec::new();
+    tagged_serialize(&input, &mut input_preimage_bytes)
+        .map_err(|e| ErrorBadRequest(format!("serialize split spend input preimage: {e}")))?;
 
-    let (proof_hex, proof_error) = if request.prove.unwrap_or(false) {
+    let (proof_hex, proved_input_hex, proof_error) = if request.prove.unwrap_or(false) {
         let ppi = input.proof.clone();
-        let key_location = input.proof.key_location.clone();
         let inline_data = request
             .proving_data
             .clone()
@@ -277,24 +281,15 @@ pub(crate) async fn prove_split_spend(
                             Box::pin(std::future::ready(Ok(inline_data_resolver.clone())))
                         }),
                     );
-                    let proving_data = match inline_data {
-                        Some(pkm) => pkm,
-                        None => resolver
-                            .resolve_key(key_location.clone())
-                            .await
-                            .map_err(|e| WorkError::BadInput(e.to_string()))?
-                            .ok_or_else(|| {
-                                WorkError::BadInput(format!(
-                                    "couldn't find split proving key {}",
-                                    &key_location.0
-                                ))
-                            })?,
+                    let provider = zkir_v2::LocalProvingProvider {
+                        rng: OsRng,
+                        params: &resolver,
+                        resolver: &resolver,
                     };
-
-                    let proof = versioned_ir::prove_split(ppi, proving_data, &resolver, 1)
+                    let proof = provider
+                        .prove(&ppi, None)
                         .await
-                        .map_err(WorkError::BadInput)?
-                        .0;
+                        .map_err(|e| WorkError::BadInput(e.to_string()))?;
 
                     let mut response = Vec::new();
                     tagged_serialize(&ProofVersioned::V2(proof), &mut response)
@@ -304,11 +299,38 @@ pub(crate) async fn prove_split_spend(
             })
             .await?;
         match JobStatus::wait_for_success(&updates).await {
-            Ok(bytes) => (Some(bytes.encode_hex()), None),
-            Err(e) => (None, Some(work_error_message(e))),
+            Ok(bytes) => {
+                let proof_versioned: ProofVersioned = tagged_deserialize(&bytes[..])
+                    .map_err(|e| ErrorBadRequest(format!("deserialize split spend proof: {e}")))?;
+                let proof = match proof_versioned {
+                    ProofVersioned::V2(proof) => proof,
+                    _ => {
+                        return Err(ErrorBadRequest(
+                            "expected split spend proof[v2], got a different version",
+                        ));
+                    }
+                };
+                let proved_input = Input {
+                    nullifier: input.nullifier,
+                    value_commitment: input.value_commitment,
+                    contract_address: input.contract_address.clone(),
+                    merkle_tree_root: input.merkle_tree_root,
+                    proof: Arc::new(proof),
+                };
+                let mut proved_input_bytes = Vec::new();
+                tagged_serialize(&proved_input, &mut proved_input_bytes).map_err(|e| {
+                    ErrorBadRequest(format!("serialize proved split spend input: {e}"))
+                })?;
+                (
+                    Some(bytes.encode_hex()),
+                    Some(proved_input_bytes.encode_hex()),
+                    None,
+                )
+            }
+            Err(e) => (None, None, Some(work_error_message(e))),
         }
     } else {
-        (None, None)
+        (None, None, None)
     };
     let status = match (&proof_hex, &proof_error, request.prove.unwrap_or(false)) {
         (Some(_), None, _) => SplitSpendStatus::ProofBuilt,
@@ -325,7 +347,9 @@ pub(crate) async fn prove_split_spend(
         raw_secret_key_present: false,
         merkle_path_source,
         preimage_hex: preimage_bytes.encode_hex(),
+        input_preimage_hex: input_preimage_bytes.encode_hex(),
         proof_hex,
+        proved_input_hex,
         proof_error,
     }))
 }

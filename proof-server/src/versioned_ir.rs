@@ -16,8 +16,7 @@ use std::sync::Arc;
 use ledger::prove::Resolver;
 use rand::rngs::OsRng;
 use serialize::tagged_deserialize;
-use std::io::Cursor;
-use transient_crypto::proofs::{Proof, ProofPreimage, ProverKey, ProvingKeyMaterial, Zkir};
+use transient_crypto::proofs::{Proof, ProofPreimage, Zkir};
 use zkir as zkir_v2;
 
 use crate::endpoints::PUBLIC_PARAMS;
@@ -79,43 +78,6 @@ pub(crate) async fn prove(
     } else {
         Err("Unsupported ZKIR version".into())
     }
-}
-
-#[cfg(feature = "experimental")]
-pub(crate) async fn prove_split(
-    _ppi: Arc<ProofPreimage>,
-    _data: ProvingKeyMaterial,
-    _resolver: &Resolver,
-    _committed_input_count: usize,
-) -> Result<(Proof, Vec<Option<usize>>), String> {
-    Err("Split proving is not implemented for experimental zkir-v3".into())
-}
-
-#[cfg(not(feature = "experimental"))]
-pub(crate) async fn prove_split(
-    ppi: Arc<ProofPreimage>,
-    data: ProvingKeyMaterial,
-    _resolver: &Resolver,
-    committed_input_count: usize,
-) -> Result<(Proof, Vec<Option<usize>>), String> {
-    let ir = tagged_deserialize::<zkir_v2::IrSource>(&mut Cursor::new(&data.ir_source[..]))
-        .map_err(|_| "Unsupported ZKIR version".to_string())?;
-    let prover_key =
-        tagged_deserialize::<ProverKey<zkir_v2::IrSource>>(&mut Cursor::new(&data.prover_key[..]))
-            .map_err(|e| e.to_string())?;
-
-    let (proof, _pis, pi_skips) = ir
-        .prove_split(
-            OsRng,
-            &*PUBLIC_PARAMS,
-            prover_key,
-            &ppi,
-            committed_input_count,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-
-    Ok((proof, pi_skips))
 }
 
 #[cfg(not(feature = "experimental"))]

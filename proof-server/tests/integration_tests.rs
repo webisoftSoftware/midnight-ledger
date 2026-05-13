@@ -604,11 +604,18 @@ mod split_spend_endpoint {
 
         let report = result.expect("preview split prove must succeed");
         eprintln!(
-            "proved preview output key_index={key_index} mt_index={mt_index} value={} token={} status={} proof_len={}",
+            "split-sent preview output key_index={key_index} mt_index={mt_index} value={} token={} recipient={} status={} proof_len={} tx_hash={} tx_id={} tx_len={} well_formed={} inclusion={} block_hash={}",
             report.coin_value,
             report.token_type_hex,
+            report.recipient_shielded_address,
             report.response["status"],
             report.proof_hex_len,
+            report.tx_hash,
+            report.tx_id.as_deref().unwrap_or(""),
+            report.tx_hex_len,
+            report.well_formed,
+            report.inclusion_status,
+            report.block_hash,
             key_index = report.key_index,
             mt_index = report.mt_index,
         );
@@ -623,6 +630,31 @@ mod split_spend_endpoint {
                 > 64
         );
         assert!(report.response["proofError"].is_null());
+        assert_eq!(report.submission["submitted"], true);
+        assert!(!report.tx_hash.is_empty());
+        assert!(
+            report
+                .tx_id
+                .as_deref()
+                .is_some_and(|tx_id| !tx_id.is_empty())
+        );
+        assert!(
+            matches!(report.well_formed.as_str(), "ok" | "skipped"),
+            "pre-submit wellFormed must be ok or skipped; got {:?}; submission={}",
+            report.well_formed,
+            report.submission
+        );
+        assert!(
+            matches!(report.inclusion_status.as_str(), "inBlock" | "finalized"),
+            "raw RPC submit must report inBlock or finalized; got {:?}; submission={}",
+            report.inclusion_status,
+            report.submission
+        );
+        assert!(
+            !report.block_hash.is_empty(),
+            "node must report a block hash for the included tx; submission={}",
+            report.submission
+        );
     }
 }
 
