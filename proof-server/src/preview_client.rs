@@ -41,6 +41,7 @@ use zswap::{Delta, Input, Offer as ZswapOffer, Output as ZswapOutput};
 
 pub type PreviewResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 const CLIENT_DERIVATION_KEY_LOCATION: &str = "split/client/sk-derivation";
+const DEFAULT_PREVIEW_TRANSFER_AMOUNT: u128 = 500 * 1_000_000;
 
 pub struct PreviewSplitProveOptions<'a> {
     pub proof_server_url: &'a str,
@@ -53,6 +54,8 @@ pub struct PreviewSplitProveReport {
     pub key_index: usize,
     pub mt_index: u64,
     pub coin_value: String,
+    pub transfer_value: String,
+    pub change_value: String,
     pub token_type_hex: String,
     pub recipient_shielded_address: String,
     pub status: String,
@@ -88,6 +91,7 @@ pub async fn prove_preview_wallet_split_spend(
             .unwrap_or(50_000)
     });
     let wallet_spend = select_preview_wallet_spend(&secret_keys, &env, event_limit)?;
+    let transfer_value = preview_transfer_amount(&env, wallet_spend.coin.value)?;
     let handoff = build_split_spend_handoff(&wallet_spend).await?;
     let body = post_split_spend_handoff(
         options.proof_server_url,
@@ -102,14 +106,18 @@ pub async fn prove_preview_wallet_split_spend(
         &wallet_spend,
         &body,
         &recipient,
+        transfer_value,
     )
     .await?;
 
     let proof_hex_len = body["proofHex"].as_str().map(str::len).unwrap_or_default();
+    let change_value = wallet_spend.coin.value - transfer_value;
     Ok(PreviewSplitProveReport {
         key_index: wallet_spend.key_index,
         mt_index: wallet_spend.mt_index,
         coin_value: wallet_spend.coin.value.to_string(),
+        transfer_value: transfer_value.to_string(),
+        change_value: change_value.to_string(),
         token_type_hex: hex::encode(wallet_spend.coin.type_.0.0),
         recipient_shielded_address: recipient.address,
         status: body["status"].as_str().unwrap_or_default().to_string(),
@@ -323,6 +331,7 @@ async fn submit_split_send_transaction(
     spend: &PreviewWalletSpend,
     split_response: &serde_json::Value,
     recipient: &PreviewRecipient,
+    transfer_value: u128,
 ) -> PreviewResult<serde_json::Value> {
     if env_value(env, "MIDNIGHT_PREVIEW_RECOVERY_PHRASE")
         .trim()
@@ -342,36 +351,53 @@ async fn submit_split_send_transaction(
     let input_preimage: Input<ProofPreimage, InMemoryDB> =
         deserialize_tagged_hex(input_preimage_hex)?;
     let proved_input: Input<Proof, InMemoryDB> = deserialize_tagged_hex(proved_input_hex)?;
-    let recipient_coin = CoinInfo::new(&mut OsRng, spend.coin.value, spend.coin.type_);
-    let output_preimage = ZswapOutput::new(
+    let change_value = spend.coin.value - transfer_value;
+    let recipient_coin = CoinInfo::new(&mut OsRng, transfer_value, spend.coin.type_);
+    let recipient_output = ZswapOutput::new(
         &mut OsRng,
         &recipient_coin,
         None,
         &recipient.coin_public_key,
         Some(recipient.encryption_public_key),
     )?;
-    let output_proof = prove_zswap_output(&output_preimage).await?;
+    let mut output_preimages = vec![recipient_output];
+    if change_value > 0 {
+        let change_coin = CoinInfo::new(&mut OsRng, change_value, spend.coin.type_);
+        output_preimages.push(ZswapOutput::new(
+            &mut OsRng,
+            &change_coin,
+            None,
+            &spend.key.coin_public_key(),
+            Some(spend.key.enc_public_key()),
+        )?);
+    }
+
+    let mut output_proofs = Vec::with_capacity(output_preimages.len());
+    for output_preimage in &output_preimages {
+        output_proofs.push(prove_zswap_output(output_preimage).await?);
+    }
     proved_input
         .well_formed(0)
         .map_err(|e| format!("server split input proof is not well formed: {e}"))?;
-    output_proof
-        .well_formed(0)
-        .map_err(|e| format!("recipient output proof is not well formed: {e}"))?;
+    for (index, output_proof) in output_proofs.iter().enumerate() {
+        output_proof
+            .well_formed(0)
+            .map_err(|e| format!("zswap output proof {index} is not well formed: {e}"))?;
+    }
 
-    let deltas = [
-        Delta {
-            token_type: spend.coin.type_,
-            value: spend.coin.value.try_into().unwrap_or(i128::MAX),
-        },
-        output_preimage.delta(),
-    ]
-    .into_iter()
+    let deltas = std::iter::once(Delta {
+        token_type: spend.coin.type_,
+        value: spend.coin.value.try_into().unwrap_or(i128::MAX),
+    })
+    .chain(output_preimages.iter().map(ZswapOutput::delta))
     .collect();
-    let binding_randomness =
-        split_input_binding_randomness(&input_preimage)? + output_preimage.binding_randomness();
+    let binding_randomness = output_preimages.iter().fold(
+        split_input_binding_randomness(&input_preimage)?,
+        |acc, output| acc + output.binding_randomness(),
+    );
     let mut unproven_offer = ZswapOffer {
         inputs: vec![input_preimage].into(),
-        outputs: vec![output_preimage].into(),
+        outputs: output_preimages.into(),
         transient: vec![].into(),
         deltas,
     };
@@ -379,7 +405,7 @@ async fn submit_split_send_transaction(
 
     let mut proven_offer = ZswapOffer {
         inputs: vec![proved_input].into(),
-        outputs: vec![output_proof].into(),
+        outputs: output_proofs.into(),
         transient: vec![].into(),
         deltas: unproven_offer.deltas.clone(),
     };
@@ -428,6 +454,29 @@ async fn submit_split_send_transaction(
     }
 
     Ok(serde_json::from_slice(&output.stdout)?)
+}
+
+fn preview_transfer_amount(env: &HashMap<String, String>, coin_value: u128) -> PreviewResult<u128> {
+    let raw = env_value(env, "MIDNIGHT_PREVIEW_TRANSFER_AMOUNT");
+    let transfer_value = if raw.trim().is_empty() {
+        DEFAULT_PREVIEW_TRANSFER_AMOUNT
+    } else {
+        raw.trim().parse::<u128>().map_err(|e| {
+            format!("MIDNIGHT_PREVIEW_TRANSFER_AMOUNT must be a positive integer: {e}")
+        })?
+    };
+
+    if transfer_value == 0 {
+        return Err("MIDNIGHT_PREVIEW_TRANSFER_AMOUNT must be greater than zero".into());
+    }
+    if transfer_value > coin_value {
+        return Err(format!(
+            "MIDNIGHT_PREVIEW_TRANSFER_AMOUNT ({transfer_value}) exceeds selected shielded coin value ({coin_value})"
+        )
+        .into());
+    }
+
+    Ok(transfer_value)
 }
 
 async fn prove_zswap_output(

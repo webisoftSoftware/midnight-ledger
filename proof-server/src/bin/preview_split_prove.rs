@@ -70,10 +70,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let report = result?;
     println!(
-        "split-sent preview output key_index={} mt_index={} value={} token={} recipient={} status={} proof_len={} tx_hash={} tx_id={} tx_len={}",
+        "split-sent preview output key_index={} mt_index={} input_value={} transfer_value={} change_value={} token={} recipient={} status={} proof_len={} tx_hash={} tx_id={} tx_len={}",
         report.key_index,
         report.mt_index,
         report.coin_value,
+        report.transfer_value,
+        report.change_value,
         report.token_type_hex,
         report.recipient_shielded_address,
         report.status,

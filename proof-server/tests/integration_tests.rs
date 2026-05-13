@@ -604,8 +604,10 @@ mod split_spend_endpoint {
 
         let report = result.expect("preview split prove must succeed");
         eprintln!(
-            "split-sent preview output key_index={key_index} mt_index={mt_index} value={} token={} recipient={} status={} proof_len={} tx_hash={} tx_id={} tx_len={} well_formed={} inclusion={} block_hash={}",
+            "split-sent preview output key_index={key_index} mt_index={mt_index} input_value={} transfer_value={} change_value={} token={} recipient={} status={} proof_len={} tx_hash={} tx_id={} tx_len={} well_formed={} inclusion={} block_hash={}",
             report.coin_value,
+            report.transfer_value,
+            report.change_value,
             report.token_type_hex,
             report.recipient_shielded_address,
             report.response["status"],
