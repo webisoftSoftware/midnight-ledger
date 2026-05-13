@@ -342,9 +342,10 @@ async fn submit_split_send_transaction(
     let input_preimage: Input<ProofPreimage, InMemoryDB> =
         deserialize_tagged_hex(input_preimage_hex)?;
     let proved_input: Input<Proof, InMemoryDB> = deserialize_tagged_hex(proved_input_hex)?;
+    let recipient_coin = CoinInfo::new(&mut OsRng, spend.coin.value, spend.coin.type_);
     let output_preimage = ZswapOutput::new(
         &mut OsRng,
-        &spend.coin,
+        &recipient_coin,
         None,
         &recipient.coin_public_key,
         Some(recipient.encryption_public_key),
