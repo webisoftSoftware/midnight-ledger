@@ -127,7 +127,7 @@ fn select_preview_wallet_spend(
                 }
                 zswap_state.coin_coms = zswap_state
                     .coin_coms
-                    .try_update_hash(mt_index, commitment.0, contract)?
+                    .update_hash(mt_index, commitment.0, contract)
                     .rehash();
                 zswap_state.coin_coms_set = zswap_state.coin_coms_set.insert(commitment, ());
                 zswap_state.first_free = mt_index + 1;

@@ -527,8 +527,7 @@ mod split_spend_endpoint {
         let mut zswap_state = ZswapLedgerState::<InMemoryDB>::new();
         zswap_state.coin_coms = zswap_state
             .coin_coms
-            .try_update_hash(0, commitment.0, None)
-            .expect("synthetic commitment should fit in zswap tree")
+            .update_hash(0, commitment.0, None)
             .rehash();
         zswap_state.coin_coms_set = HashMap::new().insert(commitment, ());
         zswap_state.first_free = 1;

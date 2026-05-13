@@ -17,7 +17,7 @@ use ledger::prove::Resolver;
 use rand::rngs::OsRng;
 use serialize::tagged_deserialize;
 use std::io::Cursor;
-use transient_crypto::proofs::{Proof, ProofPreimage, ProvingKeyMaterial, Zkir};
+use transient_crypto::proofs::{Proof, ProofPreimage, ProverKey, ProvingKeyMaterial, Zkir};
 use zkir as zkir_v2;
 
 use crate::endpoints::PUBLIC_PARAMS;
@@ -98,10 +98,10 @@ pub(crate) async fn prove_split(
     _resolver: &Resolver,
     committed_input_count: usize,
 ) -> Result<(Proof, Vec<Option<usize>>), String> {
-    let ir = zkir_v2::IrSource::load_from_tagged(Cursor::new(&data.ir_source[..]))
+    let ir = tagged_deserialize::<zkir_v2::IrSource>(&mut Cursor::new(&data.ir_source[..]))
         .map_err(|_| "Unsupported ZKIR version".to_string())?;
     let prover_key =
-        zkir_v2::IrSource::load_prover_key_from_tagged(Cursor::new(&data.prover_key[..]))
+        tagged_deserialize::<ProverKey<zkir_v2::IrSource>>(&mut Cursor::new(&data.prover_key[..]))
             .map_err(|e| e.to_string())?;
 
     let (proof, _pis, pi_skips) = ir

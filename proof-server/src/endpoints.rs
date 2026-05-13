@@ -20,7 +20,7 @@ use actix_web::{Error, HttpResponse, HttpResponseBuilder, Responder, get, post};
 use base_crypto::data_provider::{self, MidnightDataProvider};
 use base_crypto::data_provider::{FetchMode, OutputMode};
 use base_crypto::hash::HashOutput;
-use base_crypto::schnorr::Signature;
+use base_crypto::signatures::Signature;
 use coin_structure::coin::{
     Commitment, Nullifier, PublicKey as CoinPublicKey, QualifiedInfo as QualifiedCoinInfo,
     ShieldedTokenType,
@@ -364,8 +364,7 @@ fn split_spend_tree(
     }
 
     let tree = transient_crypto::merkle_tree::MerkleTree::blank(zswap::ZSWAP_TREE_HEIGHT)
-        .try_update_hash(request.mt_index, commitment_hash.0, None)
-        .map_err(|e| ErrorBadRequest(format!("invalid Merkle tree update: {e:?}")))?
+        .update_hash(request.mt_index, commitment_hash.0, None)
         .rehash();
     Ok((tree, SplitMerklePathSource::SimulatedSingleLeaf))
 }
