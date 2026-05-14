@@ -505,15 +505,14 @@ mod split_spend_endpoint {
     use super::common::*;
     use base_crypto::hash::HashOutput;
     use coin_structure::coin;
-    use coin_structure::transfer::{Recipient, SenderEvidence};
+    use coin_structure::transfer::Recipient;
     use midnight_proof_server::preview_client::{
         PreviewSplitProveOptions, PreviewWalletSpend, build_split_spend_handoff,
-        print_staged_report, prove_preview_wallet_split_spend,
+        print_staged_report, prove_preview_wallet_split_spend, split_nullifier,
     };
     use rand::SeedableRng;
     use rand::rngs::StdRng;
     use serialize::tagged_deserialize;
-    use std::borrow::Cow;
     use std::env;
     use storage::db::InMemoryDB;
     use storage::storage::HashMap;
@@ -530,7 +529,7 @@ mod split_spend_endpoint {
         let key = SecretKeys::from_rng_seed(&mut rng);
         let coin = coin::Info::new(&mut rng, 100, Default::default());
         let commitment = coin.commitment(&Recipient::User(key.coin_public_key()));
-        let nullifier = coin.nullifier(&SenderEvidence::User(Cow::Borrowed(&key.coin_secret_key)));
+        let nullifier = split_nullifier(&coin, &key.coin_secret_key);
         let mut zswap_state = ZswapLedgerState::<InMemoryDB>::new();
         zswap_state.coin_coms = zswap_state
             .coin_coms

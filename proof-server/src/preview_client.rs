@@ -4,7 +4,6 @@
 
 use base_crypto::data_provider::{FetchMode, MidnightDataProvider, OutputMode};
 use coin_structure::coin::{Commitment, Info as CoinInfo, Nullifier, PublicKey as CoinPublicKey};
-use coin_structure::transfer::SenderEvidence;
 use ledger::events::{Event, EventDetails};
 use ledger::structure::{ProofMarker, StandardTransaction, Transaction};
 use onchain_runtime::ops::{Key, Op};
@@ -26,6 +25,7 @@ use storage::storage::HashMap as StorageHashMap;
 use transient_crypto::commitment::{PedersenRandomness, PureGeneratorPedersen};
 use transient_crypto::curve::Fr;
 use transient_crypto::encryption;
+use transient_crypto::hash::{transient_hash, upgrade_from_transient};
 use transient_crypto::proofs::{
     KeyLocation, ParamsProver, ParamsProverProvider, Proof, ProofPreimage, ProvingKeyMaterial,
     Resolver,
@@ -40,6 +40,23 @@ use zswap::{Delta, Input, Offer as ZswapOffer, Output as ZswapOutput, split_coin
 pub type PreviewResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 const CLIENT_DERIVATION_KEY_LOCATION: &str = "split/client/sk-derivation";
 const DEFAULT_PREVIEW_TRANSFER_AMOUNT: u128 = 500 * 1_000_000;
+
+// Mirrors `NullifierZkfPreimage` in circuits/sk_proof.compact:
+// `"midnight:split-nul[v1]" as Field` is the ASCII bytes placed at the start
+// of a 32-byte little-endian field element, matching `split_coin_binding_domain`.
+fn split_nul_domain() -> Fr {
+    let domain = b"midnight:split-nul[v1]";
+    let mut bytes = [0u8; 32];
+    bytes[..domain.len()].copy_from_slice(domain);
+    Fr::from_le_bytes(&bytes).expect("split nullifier domain fits in Fr")
+}
+
+pub fn split_nullifier(coin: &CoinInfo, sk: &coin_structure::coin::SecretKey) -> Nullifier {
+    let mut inputs = vec![split_nul_domain()];
+    coin.field_repr(&mut inputs);
+    sk.field_repr(&mut inputs);
+    Nullifier(upgrade_from_transient(transient_hash(&inputs)))
+}
 
 pub struct PreviewSplitProveOptions<'a> {
     pub proof_server_url: &'a str,
@@ -426,8 +443,7 @@ fn select_preview_wallet_spend(
                             .map(|coin| (*key_index, key, coin))
                     })
                 {
-                    let nullifier =
-                        coin.nullifier(&SenderEvidence::User(Cow::Borrowed(&key.coin_secret_key)));
+                    let nullifier = split_nullifier(&coin, &key.coin_secret_key);
                     owned_outputs.push((
                         key_index,
                         key.clone(),
