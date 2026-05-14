@@ -508,7 +508,7 @@ mod split_spend_endpoint {
     use coin_structure::transfer::{Recipient, SenderEvidence};
     use midnight_proof_server::preview_client::{
         PreviewSplitProveOptions, PreviewWalletSpend, build_split_spend_handoff,
-        prove_preview_wallet_split_spend,
+        print_staged_report, prove_preview_wallet_split_spend,
     };
     use rand::SeedableRng;
     use rand::rngs::StdRng;
@@ -662,6 +662,7 @@ mod split_spend_endpoint {
         stop_server(server).await;
 
         let report = result.expect("preview split prove must succeed");
+        print_staged_report(&report);
         eprintln!(
             "split-sent preview output key_index={key_index} mt_index={mt_index} input_value={} transfer_value={} change_value={} token={} recipient={} status={} proof_len={} tx_hash={} tx_id={} tx_len={} well_formed={} inclusion={} block_hash={}",
             report.coin_value,

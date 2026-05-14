@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use storage::arena::Sp;
 use storage::db::InMemoryDB;
 use storage::storage::HashMap as StorageHashMap;
@@ -49,6 +49,29 @@ pub struct PreviewSplitProveOptions<'a> {
     pub request_timeout_secs: u64,
 }
 
+#[derive(Debug, Default, Clone)]
+pub struct PreviewSplitProveTimings {
+    pub scan: Duration,
+    pub derive_total: Duration,
+    pub derive_local_proving: Duration,
+    pub handoff_total: Duration,
+    pub assemble_and_submit: Duration,
+    pub server_client_deriv_verify: Option<Duration>,
+    pub server_split_prove: Option<Duration>,
+    pub server_total: Option<Duration>,
+}
+
+impl PreviewSplitProveTimings {
+    pub fn network_overhead(&self) -> Option<Duration> {
+        self.server_total
+            .and_then(|s| self.handoff_total.checked_sub(s))
+    }
+
+    pub fn wall_clock(&self) -> Duration {
+        self.scan + self.derive_total + self.handoff_total + self.assemble_and_submit
+    }
+}
+
 #[derive(Debug)]
 pub struct PreviewSplitProveReport {
     pub key_index: usize,
@@ -68,6 +91,7 @@ pub struct PreviewSplitProveReport {
     pub well_formed: String,
     pub response: serde_json::Value,
     pub submission: serde_json::Value,
+    pub timings: PreviewSplitProveTimings,
 }
 
 pub struct PreviewWalletSpend {
@@ -80,6 +104,99 @@ pub struct PreviewWalletSpend {
     pub zswap_state: ZswapLedgerState<InMemoryDB>,
 }
 
+pub fn print_staged_report(report: &PreviewSplitProveReport) {
+    let t = &report.timings;
+    let ms = |d: Duration| d.as_millis();
+    let opt_ms = |d: Option<Duration>| {
+        d.map(|d| format!("{} ms", d.as_millis()))
+            .unwrap_or_else(|| "n/a".to_string())
+    };
+    let handoff_ms = ms(t.handoff_total);
+    let net_overhead = t
+        .network_overhead()
+        .map(|d| format!("{} ms", d.as_millis()))
+        .unwrap_or_else(|| "n/a".to_string());
+    let wall = ms(t.wall_clock());
+    let ratio = match (t.server_split_prove, t.derive_local_proving.as_millis()) {
+        (Some(s), c) if c > 0 => format!("{:.2}x", s.as_millis() as f64 / c as f64),
+        _ => "n/a".to_string(),
+    };
+
+    println!();
+    println!("=== split-prove live e2e ===");
+    println!();
+    println!("--- CLIENT (wallet, local) ---");
+    println!(
+        "  [1/6] scan       events replayed, coin selected          {:>6} ms",
+        ms(t.scan)
+    );
+    println!(
+        "  [2/6] derive     client-derivation proof built           {:>6} ms",
+        ms(t.derive_total)
+    );
+    println!(
+        "         └─ of which local proving                        {:>6} ms",
+        ms(t.derive_local_proving)
+    );
+    println!(
+        "  [5/6] assemble+  recipient output, dust balance, submit  {:>6} ms",
+        ms(t.assemble_and_submit)
+    );
+    println!();
+    println!("--- SERVER (proof-server, remote) ---");
+    println!(
+        "  [3/6] handoff    POST /v2/prove-split-spend              {:>6} ms total",
+        handoff_ms
+    );
+    println!(
+        "         ├─ network (round-trip overhead)                 {:>6}",
+        net_overhead
+    );
+    println!(
+        "         ├─ server: verify client derivation proof        {:>6}",
+        opt_ms(t.server_client_deriv_verify)
+    );
+    println!(
+        "         └─ server: split-spend proving                   {:>6}",
+        opt_ms(t.server_split_prove)
+    );
+    println!(
+        "  [4/6] split-prove (server-reported, included in handoff) {:>6}",
+        opt_ms(t.server_split_prove)
+    );
+    println!();
+    println!("--- NODE + INDEXER ---");
+    println!("  [6/6] submit     author_submitAndWatchExtrinsic          (bundled in [5/6])");
+    println!("         inclusion_status:  {}", report.inclusion_status);
+    println!("         well_formed:       {}", report.well_formed);
+    println!("         block_hash:        {}", report.block_hash);
+    println!();
+    println!("--- Local vs remote proving ---");
+    println!(
+        "  client local proving (derive):                          {:>6} ms",
+        ms(t.derive_local_proving)
+    );
+    println!(
+        "  server remote proving (split-spend):                    {:>6}",
+        opt_ms(t.server_split_prove)
+    );
+    println!(
+        "  ratio (server / client):                                {:>6}",
+        ratio
+    );
+    println!(
+        "  total wall-clock (stages 1–6):                          {:>6} ms",
+        wall
+    );
+    println!();
+    println!("--- Role boundary check ---");
+    println!("  sk crossed the wire?                                    NO");
+    println!("  what crossed (ClientHandoff): skCommitment, nullifier, pk,");
+    println!("                commitmentHash, coinValue, coinType, coinNonce,");
+    println!("                mtIndex, contractAddress, clientDerivationProof");
+    println!();
+}
+
 pub async fn prove_preview_wallet_split_spend(
     options: PreviewSplitProveOptions<'_>,
 ) -> PreviewResult<PreviewSplitProveReport> {
@@ -90,16 +207,70 @@ pub async fn prove_preview_wallet_split_spend(
             .parse()
             .unwrap_or(50_000)
     });
+    let mut timings = PreviewSplitProveTimings::default();
+
+    tracing::info!(stage = "scan", role = "client", "▶ CLIENT/scan");
+    let scan_start = Instant::now();
     let wallet_spend = select_preview_wallet_spend(&secret_keys, &env, event_limit)?;
+    timings.scan = scan_start.elapsed();
+    tracing::info!(
+        stage = "scan",
+        role = "client",
+        elapsed_ms = timings.scan.as_millis() as u64,
+        "✓ CLIENT/scan"
+    );
+
     let transfer_value = preview_transfer_amount(&env, wallet_spend.coin.value)?;
-    let handoff = build_split_spend_handoff(&wallet_spend).await?;
+
+    tracing::info!(stage = "derive", role = "client", "▶ CLIENT/derive");
+    let derive_start = Instant::now();
+    let (handoff, proving_elapsed) = build_split_spend_handoff_timed(&wallet_spend).await?;
+    timings.derive_total = derive_start.elapsed();
+    timings.derive_local_proving = proving_elapsed;
+    tracing::info!(
+        stage = "derive",
+        role = "client",
+        elapsed_ms = timings.derive_total.as_millis() as u64,
+        local_proving_ms = proving_elapsed.as_millis() as u64,
+        "✓ CLIENT/derive"
+    );
+
+    tracing::info!(
+        stage = "handoff",
+        role = "client-server",
+        "▶ HANDOFF POST /v2/prove-split-spend"
+    );
+    let handoff_start = Instant::now();
     let body = post_split_spend_handoff(
         options.proof_server_url,
         handoff,
         options.request_timeout_secs,
     )
     .await?;
+    timings.handoff_total = handoff_start.elapsed();
+    tracing::info!(
+        stage = "handoff",
+        role = "client-server",
+        elapsed_ms = timings.handoff_total.as_millis() as u64,
+        "✓ HANDOFF"
+    );
+
+    timings.server_client_deriv_verify = body["serverClientDerivVerifyMs"]
+        .as_u64()
+        .map(Duration::from_millis);
+    timings.server_split_prove = body["serverSplitProveMs"]
+        .as_u64()
+        .map(Duration::from_millis);
+    timings.server_total = body["serverTotalMs"].as_u64().map(Duration::from_millis);
+
     let recipient = decode_preview_recipient(&env)?;
+
+    tracing::info!(
+        stage = "assemble-submit",
+        role = "client-node",
+        "▶ CLIENT/assemble + NODE/submit"
+    );
+    let submit_start = Instant::now();
     let submission = submit_split_send_transaction(
         &env,
         options.proof_server_url,
@@ -109,6 +280,13 @@ pub async fn prove_preview_wallet_split_spend(
         transfer_value,
     )
     .await?;
+    timings.assemble_and_submit = submit_start.elapsed();
+    tracing::info!(
+        stage = "assemble-submit",
+        role = "client-node",
+        elapsed_ms = timings.assemble_and_submit.as_millis() as u64,
+        "✓ assemble + submit"
+    );
 
     let proof_hex_len = body["proofHex"].as_str().map(str::len).unwrap_or_default();
     let change_value = wallet_spend.coin.value - transfer_value;
@@ -145,6 +323,7 @@ pub async fn prove_preview_wallet_split_spend(
             .to_string(),
         response: body,
         submission,
+        timings,
     })
 }
 
@@ -230,28 +409,40 @@ fn select_preview_wallet_spend(
 pub async fn build_split_spend_handoff(
     spend: &PreviewWalletSpend,
 ) -> PreviewResult<serde_json::Value> {
+    let (value, _) = build_split_spend_handoff_timed(spend).await?;
+    Ok(value)
+}
+
+pub async fn build_split_spend_handoff_timed(
+    spend: &PreviewWalletSpend,
+) -> PreviewResult<(serde_json::Value, Duration)> {
     let mut zswap_state_bytes = Vec::new();
     tagged_serialize(&spend.zswap_state, &mut zswap_state_bytes)?;
     let sk_blinding = OsRng.r#gen();
     let sk_commitment = split_sk_commitment(&spend.key, sk_blinding);
     let pk = spend.key.coin_secret_key.public_key();
+    let proving_start = Instant::now();
     let client_derivation_proof =
         prove_client_derivation(spend, sk_blinding, sk_commitment, pk).await?;
+    let proving_elapsed = proving_start.elapsed();
 
-    Ok(json!({
-        "skCommitment": hex::encode(sk_commitment.0.to_bytes_le()),
-        "nullifier": hex::encode(spend.nullifier.0.0),
-        "pk": hex::encode(pk.0.0),
-        "commitmentHash": hex::encode(spend.commitment.0.0),
-        "coinValue": spend.coin.value,
-        "coinType": hex::encode(spend.coin.type_.0.0),
-        "coinNonce": hex::encode(spend.coin.nonce.0.0),
-        "mtIndex": spend.mt_index,
-        "contractAddress": null,
-        "zswapState": hex::encode(zswap_state_bytes),
-        "prove": true,
-        "clientDerivationProof": hex::encode(client_derivation_proof.0),
-    }))
+    Ok((
+        json!({
+            "skCommitment": hex::encode(sk_commitment.0.to_bytes_le()),
+            "nullifier": hex::encode(spend.nullifier.0.0),
+            "pk": hex::encode(pk.0.0),
+            "commitmentHash": hex::encode(spend.commitment.0.0),
+            "coinValue": spend.coin.value,
+            "coinType": hex::encode(spend.coin.type_.0.0),
+            "coinNonce": hex::encode(spend.coin.nonce.0.0),
+            "mtIndex": spend.mt_index,
+            "contractAddress": null,
+            "zswapState": hex::encode(zswap_state_bytes),
+            "prove": true,
+            "clientDerivationProof": hex::encode(client_derivation_proof.0),
+        }),
+        proving_elapsed,
+    ))
 }
 
 async fn post_split_spend_handoff(

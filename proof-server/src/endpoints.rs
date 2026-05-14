@@ -45,6 +45,7 @@ use serialize::{tagged_deserialize, tagged_serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::sync::Arc;
+use std::time::Instant;
 use storage::arena::Sp;
 use storage::db::InMemoryDB;
 use tracing::{debug, info};
@@ -162,6 +163,11 @@ pub(crate) struct SplitSpendResponse {
     proof_hex: Option<String>,
     proved_input_hex: Option<String>,
     proof_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    server_client_deriv_verify_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    server_split_prove_ms: Option<u128>,
+    server_total_ms: u128,
 }
 
 #[derive(serde::Serialize)]
@@ -186,6 +192,7 @@ pub(crate) async fn prove_split_spend(
     request: web::Json<SplitSpendRequest>,
 ) -> Result<web::Json<SplitSpendResponse>, Error> {
     info!("Starting to process request for /v2/prove-split-spend...");
+    let server_t0 = Instant::now();
 
     let sk_commitment = fr_from_hex(&request.sk_commitment)?;
     let nullifier = Nullifier(HashOutput(bytes32_from_hex(&request.nullifier)?));
@@ -222,9 +229,24 @@ pub(crate) async fn prove_split_spend(
             "split spend proof requests must include zswapState or zswapStateFile",
         ));
     }
+    let mut server_client_deriv_verify_ms: Option<u128> = None;
     if request.prove.unwrap_or(false) {
+        info!(
+            stage = "verify-client-derivation",
+            role = "server",
+            "▶ SERVER/verify-client-derivation"
+        );
+        let verify_start = Instant::now();
         verify_client_derivation_proof(&request, sk_commitment, pk, commitment_hash, nullifier)
             .await?;
+        let elapsed = verify_start.elapsed().as_millis();
+        server_client_deriv_verify_ms = Some(elapsed);
+        info!(
+            stage = "verify-client-derivation",
+            role = "server",
+            elapsed_ms = elapsed as u64,
+            "✓ SERVER/verify-client-derivation"
+        );
     }
     let client_derivation_proof = request
         .client_derivation_proof
@@ -263,7 +285,10 @@ pub(crate) async fn prove_split_spend(
     tagged_serialize(&input, &mut input_preimage_bytes)
         .map_err(|e| ErrorBadRequest(format!("serialize split spend input preimage: {e}")))?;
 
+    let mut server_split_prove_ms: Option<u128> = None;
     let (proof_hex, proved_input_hex, proof_error) = if request.prove.unwrap_or(false) {
+        info!(stage = "split-prove", role = "server", "▶ SERVER/split-prove");
+        let prove_start = Instant::now();
         let ppi = input.proof.clone();
         let inline_data = request
             .proving_data
@@ -309,7 +334,7 @@ pub(crate) async fn prove_split_spend(
                 })
             })
             .await?;
-        match JobStatus::wait_for_success(&updates).await {
+        let outcome = match JobStatus::wait_for_success(&updates).await {
             Ok(bytes) => {
                 let proof_versioned: ProofVersioned = tagged_deserialize(&bytes[..])
                     .map_err(|e| ErrorBadRequest(format!("deserialize split spend proof: {e}")))?;
@@ -337,7 +362,16 @@ pub(crate) async fn prove_split_spend(
                 )
             }
             Err(e) => (None, None, Some(work_error_message(e))),
-        }
+        };
+        let elapsed = prove_start.elapsed().as_millis();
+        server_split_prove_ms = Some(elapsed);
+        info!(
+            stage = "split-prove",
+            role = "server",
+            elapsed_ms = elapsed as u64,
+            "✓ SERVER/split-prove"
+        );
+        outcome
     } else {
         (None, None, None)
     };
@@ -360,6 +394,9 @@ pub(crate) async fn prove_split_spend(
         proof_hex,
         proved_input_hex,
         proof_error,
+        server_client_deriv_verify_ms,
+        server_split_prove_ms,
+        server_total_ms: server_t0.elapsed().as_millis(),
     }))
 }
 

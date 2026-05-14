@@ -5,7 +5,7 @@
 use actix_web::rt;
 use clap::Parser;
 use midnight_proof_server::preview_client::{
-    PreviewSplitProveOptions, prove_preview_wallet_split_spend,
+    PreviewSplitProveOptions, print_staged_report, prove_preview_wallet_split_spend,
 };
 use midnight_proof_server::{server, worker_pool::WorkerPool};
 use tracing::{Level, info};
@@ -84,6 +84,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         report.tx_id.as_deref().unwrap_or(""),
         report.tx_hex_len,
     );
+    print_staged_report(&report);
     Ok(())
 }
 
