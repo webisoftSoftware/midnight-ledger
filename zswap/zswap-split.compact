@@ -5,29 +5,51 @@
 
 import CompactStandardLibrary;
 
+struct CoinPreimage {
+  sep: Bytes<21>,
+  info: ShieldedCoinInfo,
+  dataType: Boolean,
+  data: Bytes<32>,
+}
+
+struct SplitCoinBindingPreimage {
+  sep: Field,
+  coin: ShieldedCoinInfo,
+  publicKey: ZswapCoinPublicKey,
+}
+
 ledger merkleTree: HistoricMerkleTree<32, Bytes<32>>;
 ledger nullifiers: Set<Bytes<32>>;
 ledger valueCom: JubjubPoint;
 ledger contractAddr: ContractAddress;
 ledger publicKey: ZswapCoinPublicKey;
 ledger coinCommitment: Bytes<32>;
+ledger coinBindingTag: Field;
 ledger segment: Uint<16>;
 
 export circuit spendSplitUser(
-  skCommitment: Field,
+  pk: ZswapCoinPublicKey,
   path: MerkleTreePath<32, Bytes<32>>,
   coin: ShieldedCoinInfo,
   rc: Field,
-  coinCom: Bytes<32>,
   nullifier: Bytes<32>
 ): [] {
   merkleTree.checkRoot(disclose(merkleTreePathRootNoLeafHash<32>(path)));
+  const coinCom = persistentHash<CoinPreimage>(
+    CoinPreimage {
+      sep: "midnight:zswap-cc[v1]",
+      info: coin,
+      dataType: true,
+      data: pk.bytes,
+    });
   assert(coinCom == path.leaf, "Path must be to coin commitment");
   coinCommitment = disclose(coinCom);
-
-  // This pins the server proof to the client handoff without revealing sk.
-  // The client-side proof must separately bind skCommitment to nullifier.
-  assert(skCommitment == skCommitment, "sk commitment must be present");
+  coinBindingTag = disclose(transientHash<SplitCoinBindingPreimage>(
+    SplitCoinBindingPreimage {
+      sep: "midnight:zswap-split-coin[v1]" as Field,
+      coin: coin,
+      publicKey: pk,
+    }));
 
   nullifiers.insert(disclose(nullifier));
 
@@ -37,9 +59,6 @@ export circuit spendSplitUser(
   valueCom = disclose(ecAdd(pedersenBlinding, pedersenCommit));
 }
 
-export circuit signSplitUser(pk: ZswapCoinPublicKey, skCommitment: Field): [] {
-  // This circuit exposes the public key chosen by the client handoff.
-  // The client-side proof must separately bind skCommitment to pk.
-  assert(skCommitment == skCommitment, "sk commitment must be present");
+export circuit signSplitUser(pk: ZswapCoinPublicKey): [] {
   publicKey = disclose(pk);
 }

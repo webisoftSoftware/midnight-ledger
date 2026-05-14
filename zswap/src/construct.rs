@@ -81,18 +81,16 @@ impl AuthorizedClaim<ProofPreimage> {
         })
     }
 
-    /// Split-prove: build sign preimage with sk_commitment instead of raw sk.
+    /// Split-prove: build sign preimage without raw sk.
     pub fn new_split<R: Rng + CryptoRng + ?Sized, D: DB>(
         _rng: &mut R,
         coin: CoinInfo,
         pk: CoinPublicKey,
-        sk_commitment: Fr,
     ) -> Result<Self, OfferCreationFailed> {
         let public_transcript_prog: &[Op<ResultModeVerify, D>] =
             &Cell_write!([Key::Value(4u8.into())], false, CoinPublicKey, pk);
         let mut inputs = Vec::new();
         pk.field_repr(&mut inputs);
-        inputs.push(sk_commitment);
         let mut public_transcript_inputs = Vec::new();
         for op in filter_invalid(public_transcript_prog.iter().cloned()) {
             op.field_repr(&mut public_transcript_inputs);
@@ -258,15 +256,15 @@ impl<D: DB> Input<ProofPreimage, D> {
         Ok(inp)
     }
 
-    /// Split-prove: build spend preimage with sk_commitment instead of raw sk.
+    /// Split-prove: build spend preimage without raw sk.
     pub fn new_split<A: Debug + Storable<D>, R: Rng + CryptoRng + ?Sized>(
         rng: &mut R,
         coin: &QualifiedCoinInfo,
         segment: Option<u16>,
         nullifier: Nullifier,
         commitment_hash: Commitment,
-        sk_commitment: Fr,
         pk: CoinPublicKey,
+        coin_binding_tag: Fr,
         client_derivation_proof: Proof,
         is_contract: Option<ContractAddress>,
         tree: &MerkleTree<A, D>,
@@ -297,6 +295,12 @@ impl<D: DB> Input<ProofPreimage, D> {
             [u8; 32],
             commitment_hash.0.0
         ));
+        public_transcript_prog.extend(Cell_write!(
+            [Key::Value(6u8.into())],
+            false,
+            Fr,
+            coin_binding_tag
+        ));
         public_transcript_prog.extend(Set_insert!(
             [Key::Value(1u8.into())],
             false,
@@ -312,7 +316,7 @@ impl<D: DB> Input<ProofPreimage, D> {
             ));
         }
         public_transcript_prog.extend(
-            Cell_read!([Key::Value(6u8.into())], false, u16)
+            Cell_read!([Key::Value(7u8.into())], false, u16)
                 .into_iter()
                 .map(|op: Op<ResultModeGather, _>| op.translate(|()| segment.unwrap_or(0).into())),
         );
@@ -323,7 +327,7 @@ impl<D: DB> Input<ProofPreimage, D> {
             value_commitment.0
         ));
         let mut inputs = Vec::new();
-        inputs.push(sk_commitment);
+        pk.field_repr(&mut inputs);
         let path = tree
             .path_for_leaf(coin.mt_index, ((), commitment_hash))
             .map_err(OfferCreationFailed::InvalidIndex)?;
@@ -333,7 +337,6 @@ impl<D: DB> Input<ProofPreimage, D> {
         path.field_repr(&mut inputs);
         CoinInfo::from(coin).field_repr(&mut inputs);
         inputs.push(rc);
-        commitment_hash.field_repr(&mut inputs);
         nullifier.field_repr(&mut inputs);
         let mut public_transcript_inputs = Vec::new();
         for op in filter_invalid(public_transcript_prog.into_iter()) {
@@ -358,9 +361,9 @@ impl<D: DB> Input<ProofPreimage, D> {
         Ok(SplitInput {
             input: inp,
             split_public_inputs: SplitPublicInputs {
-                sk_commitment,
                 public_key: pk,
                 coin_commitment: commitment_hash,
+                coin_binding_tag,
             },
             client_derivation_proof,
         })

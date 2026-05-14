@@ -559,6 +559,8 @@ mod split_spend_endpoint {
             .expect("client handoff should include derivation proof");
 
         assert!(handoff["pk"].as_str().is_some());
+        assert!(handoff["coinBindingTag"].as_str().is_some());
+        assert!(handoff["skCommitment"].is_null());
         assert!(handoff["clientDerivationProof"].as_str().is_some());
 
         let response = build_client(180)
@@ -591,10 +593,7 @@ mod split_spend_endpoint {
             hex::decode(input_preimage_hex).expect("inputPreimageHex is hex");
         let input_preimage: Input<ProofPreimage, InMemoryDB> =
             tagged_deserialize(&input_preimage_bytes[..]).expect("input preimage deserializes");
-        let rc_index = input_preimage.proof.inputs.len()
-            - 1
-            - coin::Commitment::FIELD_SIZE
-            - coin::Nullifier::FIELD_SIZE;
+        let rc_index = input_preimage.proof.inputs.len() - 1 - coin::Nullifier::FIELD_SIZE;
         let expected_rc: PedersenRandomness = input_preimage.proof.inputs[rc_index]
             .try_into()
             .expect("split input rc is valid");
@@ -612,18 +611,36 @@ mod split_spend_endpoint {
             ZswapInputProof::Split(bundle) => bundle,
             ZswapInputProof::Plain(_) => panic!("proved input must carry split proof envelope"),
         };
+        let expected_tag = zswap::split_coin_binding_tag(&spend.coin, spend.key.coin_public_key());
         assert_eq!(bundle.split_public_inputs.coin_commitment, spend.commitment);
+        assert_eq!(
+            bundle.split_public_inputs.public_key,
+            spend.key.coin_public_key()
+        );
+        assert_eq!(bundle.split_public_inputs.coin_binding_tag, expected_tag);
         proved_input
             .well_formed(0)
             .expect("ledger verifier accepts split input with both proofs");
 
         let mut missing_client_proof = proved_input.clone();
-        missing_client_proof.proof = std::sync::Arc::new(bundle.spend_proof);
+        missing_client_proof.proof = std::sync::Arc::new(bundle.spend_proof.clone());
         assert!(missing_client_proof.well_formed(0).is_err());
 
         let mut tampered_nullifier = proved_input.clone();
         tampered_nullifier.nullifier = coin::Nullifier(HashOutput([7u8; 32]));
         assert!(tampered_nullifier.well_formed(0).is_err());
+
+        let mut tampered_binding = proved_input.clone();
+        let mut tampered_bundle = bundle.clone();
+        tampered_bundle.split_public_inputs.coin_binding_tag =
+            if expected_tag == transient_crypto::curve::Fr::from(1u64) {
+                transient_crypto::curve::Fr::from(2u64)
+            } else {
+                transient_crypto::curve::Fr::from(1u64)
+            };
+        tampered_binding.proof =
+            std::sync::Arc::new(ZswapInputProof::Split(tampered_bundle).encode());
+        assert!(tampered_binding.well_formed(0).is_err());
 
         let mut malformed_bundle = proved_input.clone();
         let mut malformed_bytes = malformed_bundle.proof.0.clone();
@@ -731,10 +748,7 @@ mod split_spend_endpoint {
             .unwrap_or_default()
             .trim_start_matches("0x")
             .to_lowercase();
-        let submitted_hash = report
-            .block_hash
-            .trim_start_matches("0x")
-            .to_lowercase();
+        let submitted_hash = report.block_hash.trim_start_matches("0x").to_lowercase();
         assert_eq!(
             verified_hash, submitted_hash,
             "verifier block hash must match submitter block hash; verification={verification}"

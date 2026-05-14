@@ -246,6 +246,12 @@ impl<D: DB> Input<Proof, D> {
             [u8; 32],
             split.coin_commitment.0.0
         ));
+        split_prog.extend(Cell_write!(
+            [Key::Value(6u8.into())],
+            false,
+            Fr,
+            split.coin_binding_tag
+        ));
         split_prog.extend(Set_insert!(
             [Key::Value(1u8.into())],
             false,
@@ -260,7 +266,7 @@ impl<D: DB> Input<Proof, D> {
                 *addr.deref()
             ));
         }
-        split_prog.extend(Cell_read!([Key::Value(6u8.into())], false, u16));
+        split_prog.extend(Cell_read!([Key::Value(7u8.into())], false, u16));
         split_prog.extend(Cell_write!(
             [Key::Value(2u8.into())],
             false,
@@ -292,10 +298,9 @@ fn verify_client_derivation_proof(
 ) -> Result<(), MalformedOffer> {
     let mut statement = vec![Fr::from(0u64)];
     statement.extend(client_derivation_public_transcript_inputs(
-        split.sk_commitment,
         split.public_key,
-        split.coin_commitment.0.0,
         nullifier.0.0,
+        split.coin_binding_tag,
     ));
     CLIENT_DERIVATION_VK
         .verify(&PARAMS_VERIFIER, proof, statement.into_iter())
@@ -304,20 +309,15 @@ fn verify_client_derivation_proof(
 
 #[cfg(feature = "proof-verifying")]
 fn client_derivation_public_transcript_inputs(
-    sk_commitment: Fr,
     pk: coin_structure::coin::PublicKey,
-    commitment_hash: [u8; 32],
     nullifier: [u8; 32],
+    coin_binding_tag: Fr,
 ) -> Vec<Fr> {
     let mut inputs = Vec::new();
     extend_ops(
         &mut inputs,
-        Cell_write!([Key::Value(0u8.into())], false, Fr, sk_commitment),
-    );
-    extend_ops(
-        &mut inputs,
         Cell_write!(
-            [Key::Value(1u8.into())],
+            [Key::Value(0u8.into())],
             false,
             coin_structure::coin::PublicKey,
             pk
@@ -325,11 +325,11 @@ fn client_derivation_public_transcript_inputs(
     );
     extend_ops(
         &mut inputs,
-        Cell_write!([Key::Value(2u8.into())], false, [u8; 32], commitment_hash),
+        Cell_write!([Key::Value(1u8.into())], false, [u8; 32], nullifier),
     );
     extend_ops(
         &mut inputs,
-        Cell_write!([Key::Value(3u8.into())], false, [u8; 32], nullifier),
+        Cell_write!([Key::Value(2u8.into())], false, Fr, coin_binding_tag),
     );
     inputs
 }

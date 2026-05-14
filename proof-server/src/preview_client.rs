@@ -11,7 +11,6 @@ use onchain_runtime::ops::{Key, Op};
 use onchain_runtime::program_fragments::Cell_write;
 use onchain_runtime::result_mode::ResultModeVerify;
 use onchain_runtime::state::StateValue;
-use rand::Rng;
 use rand::rngs::OsRng;
 use serde_json::json;
 use serialize::{Deserializable, Tagged, tagged_deserialize, tagged_serialize};
@@ -27,7 +26,6 @@ use storage::storage::HashMap as StorageHashMap;
 use transient_crypto::commitment::{PedersenRandomness, PureGeneratorPedersen};
 use transient_crypto::curve::Fr;
 use transient_crypto::encryption;
-use transient_crypto::hash::transient_hash;
 use transient_crypto::proofs::{
     KeyLocation, ParamsProver, ParamsProverProvider, Proof, ProofPreimage, ProvingKeyMaterial,
     Resolver,
@@ -37,7 +35,7 @@ use zkir::LocalProvingProvider;
 use zswap::keys::{SecretKeys, Seed};
 use zswap::ledger::State as ZswapLedgerState;
 use zswap::prove::ZswapResolver;
-use zswap::{Delta, Input, Offer as ZswapOffer, Output as ZswapOutput};
+use zswap::{Delta, Input, Offer as ZswapOffer, Output as ZswapOutput, split_coin_binding_tag};
 
 pub type PreviewResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 const CLIENT_DERIVATION_KEY_LOCATION: &str = "split/client/sk-derivation";
@@ -192,7 +190,7 @@ pub fn print_staged_report(report: &PreviewSplitProveReport) {
     println!();
     println!("--- Role boundary check ---");
     println!("  sk crossed the wire?                                    NO");
-    println!("  what crossed (ClientHandoff): skCommitment, nullifier, pk,");
+    println!("  what crossed (ClientHandoff): coinBindingTag, nullifier, pk,");
     println!("                commitmentHash, coinValue, coinType, coinNonce,");
     println!("                mtIndex, contractAddress, clientDerivationProof");
     println!();
@@ -473,17 +471,15 @@ pub async fn build_split_spend_handoff_timed(
 ) -> PreviewResult<(serde_json::Value, Duration)> {
     let mut zswap_state_bytes = Vec::new();
     tagged_serialize(&spend.zswap_state, &mut zswap_state_bytes)?;
-    let sk_blinding = OsRng.r#gen();
-    let sk_commitment = split_sk_commitment(&spend.key, sk_blinding);
     let pk = spend.key.coin_secret_key.public_key();
+    let coin_binding_tag = split_coin_binding_tag(&spend.coin, pk);
     let proving_start = Instant::now();
-    let client_derivation_proof =
-        prove_client_derivation(spend, sk_blinding, sk_commitment, pk).await?;
+    let client_derivation_proof = prove_client_derivation(spend, coin_binding_tag, pk).await?;
     let proving_elapsed = proving_start.elapsed();
 
     Ok((
         json!({
-            "skCommitment": hex::encode(sk_commitment.0.to_bytes_le()),
+            "coinBindingTag": hex::encode(coin_binding_tag.0.to_bytes_le()),
             "nullifier": hex::encode(spend.nullifier.0.0),
             "pk": hex::encode(pk.0.0),
             "commitmentHash": hex::encode(spend.commitment.0.0),
@@ -888,19 +884,12 @@ fn preview_zswap_secret_keys(
     Ok(SecretKeys::from(Seed::from(seed_array)))
 }
 
-fn split_sk_commitment(key: &SecretKeys, sk_blinding: Fr) -> Fr {
-    let mut sk_fields = Vec::new();
-    key.coin_secret_key.0.0.field_repr(&mut sk_fields);
-    transient_hash(&[sk_fields[0], sk_fields[1], sk_blinding])
-}
-
 async fn prove_client_derivation(
     spend: &PreviewWalletSpend,
-    sk_blinding: Fr,
-    sk_commitment: Fr,
+    coin_binding_tag: Fr,
     pk: CoinPublicKey,
 ) -> PreviewResult<transient_crypto::proofs::Proof> {
-    let preimage = build_client_derivation_preimage(spend, sk_blinding, sk_commitment, pk);
+    let preimage = build_client_derivation_preimage(spend, coin_binding_tag, pk);
     let resolver = ClientDerivationResolver::new(ZswapResolver(
         MidnightDataProvider::new(
             FetchMode::OnDemand,
@@ -918,13 +907,11 @@ async fn prove_client_derivation(
 
 fn build_client_derivation_preimage(
     spend: &PreviewWalletSpend,
-    sk_blinding: Fr,
-    sk_commitment: Fr,
+    coin_binding_tag: Fr,
     pk: CoinPublicKey,
 ) -> ProofPreimage {
     let mut inputs = Vec::new();
     spend.key.coin_secret_key.0.0.field_repr(&mut inputs);
-    inputs.push(sk_blinding);
     spend.coin.nonce.0.0.field_repr(&mut inputs);
     spend.coin.type_.0.0.field_repr(&mut inputs);
     spend.coin.value.field_repr(&mut inputs);
@@ -933,10 +920,9 @@ fn build_client_derivation_preimage(
         inputs,
         private_transcript: Vec::new(),
         public_transcript_inputs: client_derivation_public_transcript_inputs(
-            sk_commitment,
             pk,
-            spend.commitment.0.0,
             spend.nullifier.0.0,
+            coin_binding_tag,
         ),
         public_transcript_outputs: Vec::new(),
         binding_input: 0.into(),
@@ -946,27 +932,22 @@ fn build_client_derivation_preimage(
 }
 
 fn client_derivation_public_transcript_inputs(
-    sk_commitment: Fr,
     pk: CoinPublicKey,
-    commitment_hash: [u8; 32],
     nullifier: [u8; 32],
+    coin_binding_tag: Fr,
 ) -> Vec<Fr> {
     let mut inputs = Vec::new();
     extend_ops(
         &mut inputs,
-        Cell_write!([Key::Value(0u8.into())], false, Fr, sk_commitment),
+        Cell_write!([Key::Value(0u8.into())], false, CoinPublicKey, pk),
     );
     extend_ops(
         &mut inputs,
-        Cell_write!([Key::Value(1u8.into())], false, CoinPublicKey, pk),
+        Cell_write!([Key::Value(1u8.into())], false, [u8; 32], nullifier),
     );
     extend_ops(
         &mut inputs,
-        Cell_write!([Key::Value(2u8.into())], false, [u8; 32], commitment_hash),
-    );
-    extend_ops(
-        &mut inputs,
-        Cell_write!([Key::Value(3u8.into())], false, [u8; 32], nullifier),
+        Cell_write!([Key::Value(2u8.into())], false, Fr, coin_binding_tag),
     );
     inputs
 }

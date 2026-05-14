@@ -22,10 +22,11 @@ use base_crypto::data_provider::{FetchMode, OutputMode};
 use base_crypto::hash::HashOutput;
 use base_crypto::signatures::Signature;
 use coin_structure::coin::{
-    Commitment, Nullifier, PublicKey as CoinPublicKey, QualifiedInfo as QualifiedCoinInfo,
-    ShieldedTokenType,
+    Commitment, Info as CoinInfo, Nullifier, PublicKey as CoinPublicKey,
+    QualifiedInfo as QualifiedCoinInfo, ShieldedTokenType,
 };
 use coin_structure::contract::ContractAddress;
+use coin_structure::transfer::Recipient;
 use futures_util::stream::StreamExt;
 use hex::ToHex;
 use introspection::Introspection;
@@ -62,6 +63,7 @@ use zswap::Input;
 use zswap::error::MalformedOffer;
 use zswap::ledger::State as ZswapLedgerState;
 use zswap::prove::ZswapResolver;
+use zswap::split_coin_binding_tag;
 
 use crate::versioned_ir;
 use crate::worker_pool::{JobStatus, WorkError, WorkerPool};
@@ -124,7 +126,7 @@ pub(crate) async fn health() -> Result<web::Json<HealthResponse>, Error> {
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SplitSpendRequest {
-    sk_commitment: String,
+    coin_binding_tag: String,
     nullifier: String,
     pk: String,
     commitment_hash: String,
@@ -194,7 +196,7 @@ pub(crate) async fn prove_split_spend(
     info!("Starting to process request for /v2/prove-split-spend...");
     let server_t0 = Instant::now();
 
-    let sk_commitment = fr_from_hex(&request.sk_commitment)?;
+    let coin_binding_tag = fr_from_hex(&request.coin_binding_tag)?;
     let nullifier = Nullifier(HashOutput(bytes32_from_hex(&request.nullifier)?));
     let pk = CoinPublicKey(HashOutput(bytes32_from_hex(&request.pk)?));
     let commitment_hash = Commitment(HashOutput(bytes32_from_hex(&request.commitment_hash)?));
@@ -218,6 +220,24 @@ pub(crate) async fn prove_split_spend(
         nonce,
         mt_index: request.mt_index,
     };
+    if contract_address.is_some() {
+        return Err(ErrorBadRequest(
+            "split spend proof requests currently require user-owned coins",
+        ));
+    }
+    let coin_info = CoinInfo::from(&coin);
+    let expected_commitment = coin_info.commitment(&Recipient::User(pk));
+    if expected_commitment != commitment_hash {
+        return Err(ErrorBadRequest(
+            "commitmentHash does not match coin metadata and pk",
+        ));
+    }
+    let expected_coin_binding_tag = split_coin_binding_tag(&coin_info, pk);
+    if expected_coin_binding_tag != coin_binding_tag {
+        return Err(ErrorBadRequest(
+            "coinBindingTag does not match coin metadata and pk",
+        ));
+    }
     let (tree, merkle_path_source) = split_spend_tree(&request, commitment_hash)?;
     if request.prove.unwrap_or(false)
         && matches!(
@@ -229,25 +249,21 @@ pub(crate) async fn prove_split_spend(
             "split spend proof requests must include zswapState or zswapStateFile",
         ));
     }
-    let mut server_client_deriv_verify_ms: Option<u128> = None;
-    if request.prove.unwrap_or(false) {
-        info!(
-            stage = "verify-client-derivation",
-            role = "server",
-            "▶ SERVER/verify-client-derivation"
-        );
-        let verify_start = Instant::now();
-        verify_client_derivation_proof(&request, sk_commitment, pk, commitment_hash, nullifier)
-            .await?;
-        let elapsed = verify_start.elapsed().as_millis();
-        server_client_deriv_verify_ms = Some(elapsed);
-        info!(
-            stage = "verify-client-derivation",
-            role = "server",
-            elapsed_ms = elapsed as u64,
-            "✓ SERVER/verify-client-derivation"
-        );
-    }
+    info!(
+        stage = "verify-client-derivation",
+        role = "server",
+        "▶ SERVER/verify-client-derivation"
+    );
+    let verify_start = Instant::now();
+    verify_client_derivation_proof(&request, pk, nullifier, coin_binding_tag).await?;
+    let elapsed = verify_start.elapsed().as_millis();
+    let server_client_deriv_verify_ms = Some(elapsed);
+    info!(
+        stage = "verify-client-derivation",
+        role = "server",
+        elapsed_ms = elapsed as u64,
+        "✓ SERVER/verify-client-derivation"
+    );
     let client_derivation_proof = request
         .client_derivation_proof
         .as_deref()
@@ -262,8 +278,8 @@ pub(crate) async fn prove_split_spend(
         None,
         nullifier,
         commitment_hash,
-        sk_commitment,
         pk,
+        coin_binding_tag,
         client_derivation_proof,
         contract_address,
         &tree,
@@ -287,7 +303,11 @@ pub(crate) async fn prove_split_spend(
 
     let mut server_split_prove_ms: Option<u128> = None;
     let (proof_hex, proved_input_hex, proof_error) = if request.prove.unwrap_or(false) {
-        info!(stage = "split-prove", role = "server", "▶ SERVER/split-prove");
+        info!(
+            stage = "split-prove",
+            role = "server",
+            "▶ SERVER/split-prove"
+        );
         let prove_start = Instant::now();
         let ppi = input.proof.clone();
         let inline_data = request
@@ -447,10 +467,9 @@ fn zswap_state_from_hex(value: &str) -> Result<ZswapLedgerState<InMemoryDB>, Err
 
 async fn verify_client_derivation_proof(
     request: &SplitSpendRequest,
-    sk_commitment: Fr,
     pk: CoinPublicKey,
-    commitment_hash: Commitment,
     nullifier: Nullifier,
+    coin_binding_tag: Fr,
 ) -> Result<(), Error> {
     let proof_hex = request.client_derivation_proof.as_ref().ok_or_else(|| {
         ErrorBadRequest("split spend proof requests require clientDerivationProof")
@@ -462,10 +481,9 @@ async fn verify_client_derivation_proof(
     .map_err(|e| ErrorBadRequest(format!("deserialize client derivation verifier key: {e}")))?;
     let mut statement = vec![Fr::from(0u64)];
     statement.extend(client_derivation_public_transcript_inputs(
-        sk_commitment,
         pk,
-        commitment_hash.0.0,
         nullifier.0.0,
+        coin_binding_tag,
     ));
     verifier_key
         .verify(&PARAMS_VERIFIER, &proof, statement.into_iter())
@@ -473,27 +491,22 @@ async fn verify_client_derivation_proof(
 }
 
 fn client_derivation_public_transcript_inputs(
-    sk_commitment: Fr,
     pk: CoinPublicKey,
-    commitment_hash: [u8; 32],
     nullifier: [u8; 32],
+    coin_binding_tag: Fr,
 ) -> Vec<Fr> {
     let mut inputs = Vec::new();
     extend_ops(
         &mut inputs,
-        Cell_write!([Key::Value(0u8.into())], false, Fr, sk_commitment),
+        Cell_write!([Key::Value(0u8.into())], false, CoinPublicKey, pk),
     );
     extend_ops(
         &mut inputs,
-        Cell_write!([Key::Value(1u8.into())], false, CoinPublicKey, pk),
+        Cell_write!([Key::Value(1u8.into())], false, [u8; 32], nullifier),
     );
     extend_ops(
         &mut inputs,
-        Cell_write!([Key::Value(2u8.into())], false, [u8; 32], commitment_hash),
-    );
-    extend_ops(
-        &mut inputs,
-        Cell_write!([Key::Value(3u8.into())], false, [u8; 32], nullifier),
+        Cell_write!([Key::Value(2u8.into())], false, Fr, coin_binding_tag),
     );
     inputs
 }

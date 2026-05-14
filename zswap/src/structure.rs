@@ -39,6 +39,7 @@ use storage::storage::Array;
 use transient_crypto::commitment::{Pedersen, PedersenRandomness};
 use transient_crypto::curve::{EmbeddedGroupAffine, Fr};
 use transient_crypto::encryption;
+use transient_crypto::hash::transient_hash;
 use transient_crypto::merkle_tree::{MerkleTree, MerkleTreeDigest};
 use transient_crypto::proofs::{Proof, ProofPreimage};
 use transient_crypto::repr::{FieldRepr, FromFieldRepr};
@@ -244,11 +245,11 @@ tag_enforcement_test!(Input<(), InMemoryDB>);
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Serializable, Storable)]
 #[storable(base)]
-#[tag = "zswap-split-public-inputs[v1]"]
+#[tag = "zswap-split-public-inputs[v2]"]
 pub struct SplitPublicInputs {
-    pub sk_commitment: Fr,
     pub public_key: CoinPublicKey,
     pub coin_commitment: Commitment,
+    pub coin_binding_tag: Fr,
 }
 tag_enforcement_test!(SplitPublicInputs);
 
@@ -268,8 +269,22 @@ pub enum ZswapInputProof {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MalformedSplitProofBundle;
 
-const SPLIT_PROOF_BUNDLE_MAGIC: &[u8] = b"midnight:zswap-split-proof-bundle:v1";
+const SPLIT_PROOF_BUNDLE_MAGIC: &[u8] = b"midnight:zswap-split-proof-bundle:v2";
 const SPEND_SPLIT_KEY_LOCATION: &str = "midnight/zswap/spend-split";
+
+fn split_coin_binding_domain() -> Fr {
+    let domain = b"midnight:zswap-split-coin[v1]";
+    let mut bytes = [0u8; 32];
+    bytes[..domain.len()].copy_from_slice(domain);
+    Fr::from_le_bytes(&bytes).expect("split coin binding domain fits in Fr")
+}
+
+pub fn split_coin_binding_tag(coin: &CoinInfo, pk: CoinPublicKey) -> Fr {
+    let mut inputs = vec![split_coin_binding_domain()];
+    coin.field_repr(&mut inputs);
+    pk.field_repr(&mut inputs);
+    transient_hash(&inputs)
+}
 
 impl ZswapInputProof {
     pub fn encode(self) -> Proof {
@@ -312,9 +327,9 @@ impl SplitProofBundle {
         bytes.extend_from_slice(SPLIT_PROOF_BUNDLE_MAGIC);
         append_len_prefixed(&mut bytes, &self.spend_proof.0);
         append_len_prefixed(&mut bytes, &self.client_derivation_proof.0);
-        bytes.extend_from_slice(&self.split_public_inputs.sk_commitment.as_le_bytes());
         bytes.extend_from_slice(&self.split_public_inputs.public_key.0.0);
         bytes.extend_from_slice(&self.split_public_inputs.coin_commitment.0.0);
+        bytes.extend_from_slice(&self.split_public_inputs.coin_binding_tag.as_le_bytes());
         Proof(bytes)
     }
 
@@ -333,24 +348,24 @@ impl SplitProofBundle {
                 .ok_or(MalformedSplitProofBundle)?
                 .to_vec(),
         );
-        let sk_commitment =
-            Fr::from_le_bytes(read_exact(&mut remaining, 32).ok_or(MalformedSplitProofBundle)?)
-                .ok_or(MalformedSplitProofBundle)?;
         let public_key = CoinPublicKey(HashOutput(
             read_exact_array(&mut remaining).ok_or(MalformedSplitProofBundle)?,
         ));
         let coin_commitment = Commitment(HashOutput(
             read_exact_array(&mut remaining).ok_or(MalformedSplitProofBundle)?,
         ));
+        let coin_binding_tag =
+            Fr::from_le_bytes(read_exact(&mut remaining, 32).ok_or(MalformedSplitProofBundle)?)
+                .ok_or(MalformedSplitProofBundle)?;
         if !remaining.is_empty() {
             return Err(MalformedSplitProofBundle);
         }
         Ok(SplitProofBundle {
             spend_proof,
             split_public_inputs: SplitPublicInputs {
-                sk_commitment,
                 public_key,
                 coin_commitment,
+                coin_binding_tag,
             },
             client_derivation_proof,
         })
@@ -435,7 +450,7 @@ impl<P: Storable<D>, D: DB> Input<P, D> {
 impl<D: DB> Input<ProofPreimage, D> {
     fn public_witness_trailer_len(&self) -> usize {
         if self.proof.key_location.0.as_ref() == SPEND_SPLIT_KEY_LOCATION {
-            Commitment::FIELD_SIZE + Nullifier::FIELD_SIZE
+            Nullifier::FIELD_SIZE
         } else {
             0
         }
@@ -831,7 +846,7 @@ impl Debug for Symbol {
 
 pub const INPUT_PIS: usize = 68;
 pub const INPUT_PROOF_SIZE: usize = 4_832;
-pub const CLIENT_DERIVATION_PIS: usize = 48;
+pub const CLIENT_DERIVATION_PIS: usize = 36;
 pub const OUTPUT_PIS: usize = 77;
 pub const OUTPUT_PROOF_SIZE: usize = 4_832;
 pub const AUTHORIZED_CLAIM_PIS: usize = 13;
