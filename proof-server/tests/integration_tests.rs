@@ -717,6 +717,43 @@ mod split_spend_endpoint {
             "node must report a block hash for the included tx; submission={}",
             report.submission
         );
+
+        // Independent on-chain verification: a second, fresh node connection
+        // must observe the same tx bytes inside the reported block and confirm
+        // the block is on the canonical chain.
+        let verification = &report.verification;
+        assert_eq!(
+            verification["verified"], true,
+            "independent on-chain verification must succeed; verification={verification}"
+        );
+        let verified_hash = verification["blockHash"]
+            .as_str()
+            .unwrap_or_default()
+            .trim_start_matches("0x")
+            .to_lowercase();
+        let submitted_hash = report
+            .block_hash
+            .trim_start_matches("0x")
+            .to_lowercase();
+        assert_eq!(
+            verified_hash, submitted_hash,
+            "verifier block hash must match submitter block hash; verification={verification}"
+        );
+        assert!(
+            verification["blockNumber"].as_u64().unwrap_or(0) > 0,
+            "verifier must report a positive block number; verification={verification}"
+        );
+        assert!(
+            verification["extrinsicIndex"].as_i64().unwrap_or(-1) >= 0,
+            "verifier must locate the inner tx in a block extrinsic; verification={verification}"
+        );
+        eprintln!(
+            "onchain-verify block_number={} extrinsic_index={} finalized_depth={} finalized={}",
+            verification["blockNumber"],
+            verification["extrinsicIndex"],
+            verification["finalizedDepth"],
+            verification["finalized"],
+        );
     }
 }
 

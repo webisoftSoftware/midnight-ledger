@@ -91,6 +91,7 @@ pub struct PreviewSplitProveReport {
     pub well_formed: String,
     pub response: serde_json::Value,
     pub submission: serde_json::Value,
+    pub verification: serde_json::Value,
     pub timings: PreviewSplitProveTimings,
 }
 
@@ -290,6 +291,23 @@ pub async fn prove_preview_wallet_split_spend(
 
     let proof_hex_len = body["proofHex"].as_str().map(str::len).unwrap_or_default();
     let change_value = wallet_spend.coin.value - transfer_value;
+
+    tracing::info!(
+        stage = "onchain-verify",
+        role = "node",
+        "▶ NODE/independent on-chain verification"
+    );
+    let verify_start = Instant::now();
+    let verification = verify_onchain_inclusion(&env, &submission)?;
+    tracing::info!(
+        stage = "onchain-verify",
+        role = "node",
+        elapsed_ms = verify_start.elapsed().as_millis() as u64,
+        block_number = verification["blockNumber"].as_u64().unwrap_or_default(),
+        finalized_depth = verification["finalizedDepth"].as_i64().unwrap_or_default(),
+        "✓ independent on-chain verification"
+    );
+
     Ok(PreviewSplitProveReport {
         key_index: wallet_spend.key_index,
         mt_index: wallet_spend.mt_index,
@@ -323,8 +341,45 @@ pub async fn prove_preview_wallet_split_spend(
             .to_string(),
         response: body,
         submission,
+        verification,
         timings,
     })
+}
+
+fn verify_onchain_inclusion(
+    env: &HashMap<String, String>,
+    submission: &serde_json::Value,
+) -> PreviewResult<serde_json::Value> {
+    let block_hash = submission["blockHash"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .ok_or("submission missing blockHash; cannot verify on-chain inclusion")?;
+    let inner_tx_hex = submission["balancedTxHex"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .ok_or("submission missing balancedTxHex; cannot verify on-chain inclusion")?;
+    let tx_id = submission["txId"].as_str().unwrap_or("");
+
+    let output = Command::new("node")
+        .arg(repo_root_tool("tools/preview_verify_onchain.mjs")?)
+        .arg("--block-hash")
+        .arg(block_hash)
+        .arg("--inner-tx-hex")
+        .arg(inner_tx_hex)
+        .arg("--tx-id")
+        .arg(tx_id)
+        .envs(env.iter())
+        .output()?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "independent on-chain verification failed: stderr={} stdout={}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout),
+        )
+        .into());
+    }
+    Ok(serde_json::from_slice(&output.stdout)?)
 }
 
 fn select_preview_wallet_spend(
