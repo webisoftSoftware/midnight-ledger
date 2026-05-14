@@ -4,6 +4,7 @@
 
 use base_crypto::data_provider::{FetchMode, MidnightDataProvider, OutputMode};
 use coin_structure::coin::{Commitment, Info as CoinInfo, Nullifier, PublicKey as CoinPublicKey};
+use coin_structure::transfer::SenderEvidence;
 use ledger::events::{Event, EventDetails};
 use ledger::structure::{ProofMarker, StandardTransaction, Transaction};
 use onchain_runtime::ops::{Key, Op};
@@ -25,7 +26,6 @@ use storage::storage::HashMap as StorageHashMap;
 use transient_crypto::commitment::{PedersenRandomness, PureGeneratorPedersen};
 use transient_crypto::curve::Fr;
 use transient_crypto::encryption;
-use transient_crypto::hash::{transient_hash, upgrade_from_transient};
 use transient_crypto::proofs::{
     KeyLocation, ParamsProver, ParamsProverProvider, Proof, ProofPreimage, ProvingKeyMaterial,
     Resolver,
@@ -41,21 +41,8 @@ pub type PreviewResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 const CLIENT_DERIVATION_KEY_LOCATION: &str = "split/client/sk-derivation";
 const DEFAULT_PREVIEW_TRANSFER_AMOUNT: u128 = 500 * 1_000_000;
 
-// Mirrors `NullifierZkfPreimage` in circuits/sk_proof.compact:
-// `"midnight:split-nul[v1]" as Field` is the ASCII bytes placed at the start
-// of a 32-byte little-endian field element, matching `split_coin_binding_domain`.
-fn split_nul_domain() -> Fr {
-    let domain = b"midnight:split-nul[v1]";
-    let mut bytes = [0u8; 32];
-    bytes[..domain.len()].copy_from_slice(domain);
-    Fr::from_le_bytes(&bytes).expect("split nullifier domain fits in Fr")
-}
-
 pub fn split_nullifier(coin: &CoinInfo, sk: &coin_structure::coin::SecretKey) -> Nullifier {
-    let mut inputs = vec![split_nul_domain()];
-    coin.field_repr(&mut inputs);
-    sk.field_repr(&mut inputs);
-    Nullifier(upgrade_from_transient(transient_hash(&inputs)))
+    coin.nullifier(&SenderEvidence::User(Cow::Borrowed(sk)))
 }
 
 pub struct PreviewSplitProveOptions<'a> {
@@ -80,6 +67,16 @@ impl PreviewSplitProveTimings {
     pub fn network_overhead(&self) -> Option<Duration> {
         self.server_total
             .and_then(|s| self.handoff_total.checked_sub(s))
+    }
+
+    pub fn split_proof_total(&self) -> Option<Duration> {
+        self.server_split_prove
+            .and_then(|server| self.derive_local_proving.checked_add(server))
+    }
+
+    pub fn handoff_non_proving(&self) -> Option<Duration> {
+        self.server_split_prove
+            .and_then(|server| self.handoff_total.checked_sub(server))
     }
 
     pub fn wall_clock(&self) -> Duration {
@@ -132,6 +129,8 @@ pub fn print_staged_report(report: &PreviewSplitProveReport) {
         .network_overhead()
         .map(|d| format!("{} ms", d.as_millis()))
         .unwrap_or_else(|| "n/a".to_string());
+    let proof_total = opt_ms(t.split_proof_total());
+    let handoff_non_proving = opt_ms(t.handoff_non_proving());
     let wall = ms(t.wall_clock());
     let ratio = match (t.server_split_prove, t.derive_local_proving.as_millis()) {
         (Some(s), c) if c > 0 => format!("{:.2}x", s.as_millis() as f64 / c as f64),
@@ -140,6 +139,24 @@ pub fn print_staged_report(report: &PreviewSplitProveReport) {
 
     println!();
     println!("=== split-prove live e2e ===");
+    println!();
+    println!("--- Proof-only comparison (split-prove work) ---");
+    println!(
+        "  client proof:  clientDerivationProof (local)        {:>6} ms",
+        ms(t.derive_local_proving)
+    );
+    println!(
+        "  server proof:  spend-split proof (remote)           {:>6}",
+        opt_ms(t.server_split_prove)
+    );
+    println!(
+        "  split-prove proving total                           {:>6}",
+        proof_total
+    );
+    println!(
+        "  ratio (server proof / client proof)                 {:>6}",
+        ratio
+    );
     println!();
     println!("--- CLIENT (wallet, local) ---");
     println!(
@@ -158,6 +175,7 @@ pub fn print_staged_report(report: &PreviewSplitProveReport) {
         "  [5/6] assemble+  recipient output, dust balance, submit  {:>6} ms",
         ms(t.assemble_and_submit)
     );
+    println!("         └─ baseline wallet tx work; excluded from proof-only comparison");
     println!();
     println!("--- SERVER (proof-server, remote) ---");
     println!(
@@ -176,10 +194,6 @@ pub fn print_staged_report(report: &PreviewSplitProveReport) {
         "         └─ server: split-spend proving                   {:>6}",
         opt_ms(t.server_split_prove)
     );
-    println!(
-        "  [4/6] split-prove (server-reported, included in handoff) {:>6}",
-        opt_ms(t.server_split_prove)
-    );
     println!();
     println!("--- NODE + INDEXER ---");
     println!("  [6/6] submit     author_submitAndWatchExtrinsic          (bundled in [5/6])");
@@ -187,21 +201,17 @@ pub fn print_staged_report(report: &PreviewSplitProveReport) {
     println!("         well_formed:       {}", report.well_formed);
     println!("         block_hash:        {}", report.block_hash);
     println!();
-    println!("--- Local vs remote proving ---");
+    println!("--- End-to-end context (not proof comparison) ---");
     println!(
-        "  client local proving (derive):                          {:>6} ms",
-        ms(t.derive_local_proving)
+        "  handoff non-proving time (network + server verify)       {:>6}",
+        handoff_non_proving
     );
     println!(
-        "  server remote proving (split-spend):                    {:>6}",
-        opt_ms(t.server_split_prove)
+        "  tx assembly, output proof, Dust balance, submit          {:>6} ms",
+        ms(t.assemble_and_submit)
     );
     println!(
-        "  ratio (server / client):                                {:>6}",
-        ratio
-    );
-    println!(
-        "  total wall-clock (stages 1–6):                          {:>6} ms",
+        "  full demo wall-clock (scan → included tx)                {:>6} ms",
         wall
     );
     println!();

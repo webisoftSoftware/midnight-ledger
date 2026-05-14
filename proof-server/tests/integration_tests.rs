@@ -505,7 +505,7 @@ mod split_spend_endpoint {
     use super::common::*;
     use base_crypto::hash::HashOutput;
     use coin_structure::coin;
-    use coin_structure::transfer::Recipient;
+    use coin_structure::transfer::{Recipient, SenderEvidence};
     use midnight_proof_server::preview_client::{
         PreviewSplitProveOptions, PreviewWalletSpend, build_split_spend_handoff,
         print_staged_report, prove_preview_wallet_split_spend, split_nullifier,
@@ -513,6 +513,7 @@ mod split_spend_endpoint {
     use rand::SeedableRng;
     use rand::rngs::StdRng;
     use serialize::tagged_deserialize;
+    use std::borrow::Cow;
     use std::env;
     use storage::db::InMemoryDB;
     use storage::storage::HashMap;
@@ -530,6 +531,10 @@ mod split_spend_endpoint {
         let coin = coin::Info::new(&mut rng, 100, Default::default());
         let commitment = coin.commitment(&Recipient::User(key.coin_public_key()));
         let nullifier = split_nullifier(&coin, &key.coin_secret_key);
+        assert_eq!(
+            nullifier,
+            coin.nullifier(&SenderEvidence::User(Cow::Borrowed(&key.coin_secret_key)))
+        );
         let mut zswap_state = ZswapLedgerState::<InMemoryDB>::new();
         zswap_state.coin_coms = zswap_state
             .coin_coms
@@ -680,13 +685,33 @@ mod split_spend_endpoint {
         let report = result.expect("preview split prove must succeed");
         print_staged_report(&report);
         eprintln!(
-            "split-sent preview output key_index={key_index} mt_index={mt_index} input_value={} transfer_value={} change_value={} token={} recipient={} status={} proof_len={} tx_hash={} tx_id={} tx_len={} well_formed={} inclusion={} block_hash={}",
+            "split-sent preview output key_index={key_index} mt_index={mt_index} input_value={} transfer_value={} change_value={} token={} recipient={} status={} client_proof_ms={} server_proof_ms={} split_proof_total_ms={} server_client_ratio={} proof_len={} tx_hash={} tx_id={} tx_len={} well_formed={} inclusion={} block_hash={}",
             report.coin_value,
             report.transfer_value,
             report.change_value,
             report.token_type_hex,
             report.recipient_shielded_address,
             report.response["status"],
+            report.timings.derive_local_proving.as_millis(),
+            report
+                .timings
+                .server_split_prove
+                .map(|duration| duration.as_millis().to_string())
+                .unwrap_or_else(|| "n/a".to_string()),
+            report
+                .timings
+                .split_proof_total()
+                .map(|duration| duration.as_millis().to_string())
+                .unwrap_or_else(|| "n/a".to_string()),
+            report
+                .timings
+                .server_split_prove
+                .and_then(|server| {
+                    let client = report.timings.derive_local_proving.as_millis();
+                    (client > 0)
+                        .then(|| format!("{:.2}x", server.as_millis() as f64 / client as f64))
+                })
+                .unwrap_or_else(|| "n/a".to_string()),
             report.proof_hex_len,
             report.tx_hash,
             report.tx_id.as_deref().unwrap_or(""),
