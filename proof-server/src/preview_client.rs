@@ -32,7 +32,7 @@ use transient_crypto::proofs::{
     KeyLocation, ParamsProver, ParamsProverProvider, Proof, ProofPreimage, ProvingKeyMaterial,
     Resolver,
 };
-use transient_crypto::repr::{FieldRepr, FromFieldRepr};
+use transient_crypto::repr::FieldRepr;
 use zkir::LocalProvingProvider;
 use zswap::keys::{SecretKeys, Seed};
 use zswap::ledger::State as ZswapLedgerState;
@@ -391,10 +391,11 @@ async fn submit_split_send_transaction(
     })
     .chain(output_preimages.iter().map(ZswapOutput::delta))
     .collect();
-    let binding_randomness = output_preimages.iter().fold(
-        split_input_binding_randomness(&input_preimage)?,
-        |acc, output| acc + output.binding_randomness(),
-    );
+    let binding_randomness = output_preimages
+        .iter()
+        .fold(input_preimage.binding_randomness(), |acc, output| {
+            acc + output.binding_randomness()
+        });
     let mut unproven_offer = ZswapOffer {
         inputs: vec![input_preimage].into(),
         outputs: output_preimages.into(),
@@ -509,20 +510,6 @@ fn deserialize_tagged_hex<T: Deserializable + Tagged>(value: &str) -> PreviewRes
 fn deserialize_hex<T: Deserializable>(value: &str) -> PreviewResult<T> {
     let bytes = hex::decode(value.trim().trim_start_matches("0x"))?;
     Ok(T::deserialize(&mut &bytes[..], 0)?)
-}
-
-fn split_input_binding_randomness(
-    input: &Input<ProofPreimage, InMemoryDB>,
-) -> PreviewResult<PedersenRandomness> {
-    let rc_index = input
-        .proof
-        .inputs
-        .len()
-        .checked_sub(1 + Nullifier::FIELD_SIZE)
-        .ok_or("split input preimage is too short to contain binding randomness")?;
-    input.proof.inputs[rc_index]
-        .try_into()
-        .map_err(|_| "split input binding randomness is invalid".into())
 }
 
 pub fn preview_env() -> HashMap<String, String> {

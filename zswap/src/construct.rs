@@ -43,7 +43,7 @@ use transient_crypto::curve::{EmbeddedFr, Fr};
 use transient_crypto::encryption;
 use transient_crypto::hash::{degrade_to_transient, transient_commit, transient_hash};
 use transient_crypto::merkle_tree::{MerklePath, MerkleTree, MerkleTreeDigest};
-use transient_crypto::proofs::{KeyLocation, ProofPreimage};
+use transient_crypto::proofs::{KeyLocation, Proof, ProofPreimage};
 use transient_crypto::repr::FieldRepr;
 
 impl AuthorizedClaim<ProofPreimage> {
@@ -266,9 +266,11 @@ impl<D: DB> Input<ProofPreimage, D> {
         nullifier: Nullifier,
         commitment_hash: Commitment,
         sk_commitment: Fr,
+        pk: CoinPublicKey,
+        client_derivation_proof: Proof,
         is_contract: Option<ContractAddress>,
         tree: &MerkleTree<A, D>,
-    ) -> Result<Self, OfferCreationFailed> {
+    ) -> Result<SplitInput<D>, OfferCreationFailed> {
         let rc_e: EmbeddedFr = rng.r#gen();
         let rc = Fr::try_from(rc_e).expect("Fr should be larger than EmbeddedFr");
         let value_commitment = Pedersen::commit(
@@ -289,6 +291,12 @@ impl<D: DB> Input<ProofPreimage, D> {
             .into_iter()
             .map(|op: Op<ResultModeGather, D>| op.translate(|()| true.into())),
         );
+        public_transcript_prog.extend(Cell_write!(
+            [Key::Value(5u8.into())],
+            false,
+            [u8; 32],
+            commitment_hash.0.0
+        ));
         public_transcript_prog.extend(Set_insert!(
             [Key::Value(1u8.into())],
             false,
@@ -304,7 +312,7 @@ impl<D: DB> Input<ProofPreimage, D> {
             ));
         }
         public_transcript_prog.extend(
-            Cell_read!([Key::Value(5u8.into())], false, u16)
+            Cell_read!([Key::Value(6u8.into())], false, u16)
                 .into_iter()
                 .map(|op: Op<ResultModeGather, _>| op.translate(|()| segment.unwrap_or(0).into())),
         );
@@ -325,6 +333,7 @@ impl<D: DB> Input<ProofPreimage, D> {
         path.field_repr(&mut inputs);
         CoinInfo::from(coin).field_repr(&mut inputs);
         inputs.push(rc);
+        commitment_hash.field_repr(&mut inputs);
         nullifier.field_repr(&mut inputs);
         let mut public_transcript_inputs = Vec::new();
         for op in filter_invalid(public_transcript_prog.into_iter()) {
@@ -346,7 +355,15 @@ impl<D: DB> Input<ProofPreimage, D> {
             merkle_tree_root,
             proof: Arc::new(proof_preimage),
         };
-        Ok(inp)
+        Ok(SplitInput {
+            input: inp,
+            split_public_inputs: SplitPublicInputs {
+                sk_commitment,
+                public_key: pk,
+                coin_commitment: commitment_hash,
+            },
+            client_derivation_proof,
+        })
     }
 }
 
@@ -354,16 +371,17 @@ fn raw_leaf_hash_root<T>(
     leaf_hash: transient_crypto::hash::HashOutput,
     path: &MerklePath<T>,
 ) -> MerkleTreeDigest {
-    MerkleTreeDigest(path.path.iter().fold(
-        degrade_to_transient(leaf_hash),
-        |acc, entry| {
-            if entry.goes_left {
-                transient_hash(&[acc, entry.sibling.0])
-            } else {
-                transient_hash(&[entry.sibling.0, acc])
-            }
-        },
-    ))
+    MerkleTreeDigest(
+        path.path
+            .iter()
+            .fold(degrade_to_transient(leaf_hash), |acc, entry| {
+                if entry.goes_left {
+                    transient_hash(&[acc, entry.sibling.0])
+                } else {
+                    transient_hash(&[entry.sibling.0, acc])
+                }
+            }),
+    )
 }
 
 impl<D: DB> Output<ProofPreimage, D> {

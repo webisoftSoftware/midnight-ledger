@@ -503,6 +503,7 @@ mod prove_tx_endpoint {
 
 mod split_spend_endpoint {
     use super::common::*;
+    use base_crypto::hash::HashOutput;
     use coin_structure::coin;
     use coin_structure::transfer::{Recipient, SenderEvidence};
     use midnight_proof_server::preview_client::{
@@ -511,12 +512,18 @@ mod split_spend_endpoint {
     };
     use rand::SeedableRng;
     use rand::rngs::StdRng;
+    use serialize::tagged_deserialize;
     use std::borrow::Cow;
     use std::env;
     use storage::db::InMemoryDB;
     use storage::storage::HashMap;
+    use transient_crypto::commitment::PedersenRandomness;
+    use transient_crypto::proofs::{Proof, ProofPreimage};
+    use transient_crypto::repr::FromFieldRepr;
+    use zswap::error::MalformedOffer;
     use zswap::keys::SecretKeys;
     use zswap::ledger::State as ZswapLedgerState;
+    use zswap::{Input, ZswapInputProof};
 
     fn synthetic_wallet_spend() -> PreviewWalletSpend {
         let mut rng = StdRng::seed_from_u64(0x51504c4954);
@@ -574,6 +581,58 @@ mod split_spend_endpoint {
                 .len()
                 > 64
         );
+        let proved_input_hex = body["provedInputHex"]
+            .as_str()
+            .expect("provedInputHex should be present");
+        let input_preimage_hex = body["inputPreimageHex"]
+            .as_str()
+            .expect("inputPreimageHex should be present");
+        let input_preimage_bytes =
+            hex::decode(input_preimage_hex).expect("inputPreimageHex is hex");
+        let input_preimage: Input<ProofPreimage, InMemoryDB> =
+            tagged_deserialize(&input_preimage_bytes[..]).expect("input preimage deserializes");
+        let rc_index = input_preimage.proof.inputs.len()
+            - 1
+            - coin::Commitment::FIELD_SIZE
+            - coin::Nullifier::FIELD_SIZE;
+        let expected_rc: PedersenRandomness = input_preimage.proof.inputs[rc_index]
+            .try_into()
+            .expect("split input rc is valid");
+        assert_eq!(input_preimage.binding_randomness(), expected_rc);
+        let spent_delta = input_preimage.delta();
+        assert!(spent_delta.token_type == spend.coin.type_);
+        assert!(spent_delta.value == i128::try_from(spend.coin.value).unwrap());
+        let proved_input_bytes = hex::decode(proved_input_hex).expect("provedInputHex is hex");
+        let proved_input: Input<Proof, InMemoryDB> =
+            tagged_deserialize(&proved_input_bytes[..]).expect("proved input deserializes");
+
+        let bundle = match ZswapInputProof::decode(&proved_input.proof)
+            .expect("proved input proof envelope decodes")
+        {
+            ZswapInputProof::Split(bundle) => bundle,
+            ZswapInputProof::Plain(_) => panic!("proved input must carry split proof envelope"),
+        };
+        assert_eq!(bundle.split_public_inputs.coin_commitment, spend.commitment);
+        proved_input
+            .well_formed(0)
+            .expect("ledger verifier accepts split input with both proofs");
+
+        let mut missing_client_proof = proved_input.clone();
+        missing_client_proof.proof = std::sync::Arc::new(bundle.spend_proof);
+        assert!(missing_client_proof.well_formed(0).is_err());
+
+        let mut tampered_nullifier = proved_input.clone();
+        tampered_nullifier.nullifier = coin::Nullifier(HashOutput([7u8; 32]));
+        assert!(tampered_nullifier.well_formed(0).is_err());
+
+        let mut malformed_bundle = proved_input.clone();
+        let mut malformed_bytes = malformed_bundle.proof.0.clone();
+        malformed_bytes.pop();
+        malformed_bundle.proof = std::sync::Arc::new(Proof(malformed_bytes));
+        assert!(matches!(
+            malformed_bundle.well_formed(0),
+            Err(MalformedOffer::MalformedSplitProofBundle)
+        ));
 
         stop_server(server).await;
     }

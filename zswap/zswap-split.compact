@@ -10,6 +10,7 @@ ledger nullifiers: Set<Bytes<32>>;
 ledger valueCom: JubjubPoint;
 ledger contractAddr: ContractAddress;
 ledger publicKey: ZswapCoinPublicKey;
+ledger coinCommitment: Bytes<32>;
 ledger segment: Uint<16>;
 
 export circuit spendSplitUser(
@@ -17,9 +18,12 @@ export circuit spendSplitUser(
   path: MerkleTreePath<32, Bytes<32>>,
   coin: ShieldedCoinInfo,
   rc: Field,
+  coinCom: Bytes<32>,
   nullifier: Bytes<32>
 ): [] {
   merkleTree.checkRoot(disclose(merkleTreePathRootNoLeafHash<32>(path)));
+  assert(coinCom == path.leaf, "Path must be to coin commitment");
+  coinCommitment = disclose(coinCom);
 
   // This pins the server proof to the client handoff without revealing sk.
   // The client-side proof must separately bind skCommitment to nullifier.

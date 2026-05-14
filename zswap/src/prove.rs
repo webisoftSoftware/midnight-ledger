@@ -158,6 +158,16 @@ impl<D: DB> Input<ProofPreimage, D> {
     }
 }
 
+impl<D: DB> SplitInput<D> {
+    pub async fn prove(
+        self,
+        prover: impl ProvingProvider,
+    ) -> Result<Input<Proof, D>, ProvingError> {
+        let spend_proof = prover.prove(&self.input.proof, None).await?;
+        Ok(self.into_proved_input(spend_proof))
+    }
+}
+
 impl<D: DB> Output<ProofPreimage, D> {
     pub async fn prove(
         &self,
@@ -262,6 +272,10 @@ mod tests {
             Input::new_contract_owned(&mut rng, &qcoin, None, Default::default(), &tree).unwrap();
         let inp_proven = inp.prove(provider.split()).await.unwrap();
         assert_eq!(inp_proven.proof.0.len(), INPUT_PROOF_SIZE);
+        assert!(matches!(
+            ZswapInputProof::decode(&inp_proven.proof).unwrap(),
+            ZswapInputProof::Plain(_)
+        ));
 
         let out =
             Output::<_, InMemoryDB>::new_contract_owned(&mut rng, &coin, None, Default::default())

@@ -13,6 +13,7 @@
 
 use crate::ZSWAP_TREE_HEIGHT;
 use crate::error::MalformedOffer;
+use base_crypto::hash::HashOutput;
 use coin_structure::coin::{
     Commitment, Info as CoinInfo, Nullifier, PublicKey as CoinPublicKey, ShieldedTokenType,
     TokenType, UnshieldedTokenType,
@@ -39,7 +40,7 @@ use transient_crypto::commitment::{Pedersen, PedersenRandomness};
 use transient_crypto::curve::{EmbeddedGroupAffine, Fr};
 use transient_crypto::encryption;
 use transient_crypto::merkle_tree::{MerkleTree, MerkleTreeDigest};
-use transient_crypto::proofs::ProofPreimage;
+use transient_crypto::proofs::{Proof, ProofPreimage};
 use transient_crypto::repr::{FieldRepr, FromFieldRepr};
 
 macro_rules! exptfile {
@@ -241,6 +242,174 @@ pub struct Input<P: Storable<D>, D: DB> {
 }
 tag_enforcement_test!(Input<(), InMemoryDB>);
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Serializable, Storable)]
+#[storable(base)]
+#[tag = "zswap-split-public-inputs[v1]"]
+pub struct SplitPublicInputs {
+    pub sk_commitment: Fr,
+    pub public_key: CoinPublicKey,
+    pub coin_commitment: Commitment,
+}
+tag_enforcement_test!(SplitPublicInputs);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SplitProofBundle {
+    pub spend_proof: Proof,
+    pub split_public_inputs: SplitPublicInputs,
+    pub client_derivation_proof: Proof,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ZswapInputProof {
+    Plain(Proof),
+    Split(SplitProofBundle),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MalformedSplitProofBundle;
+
+const SPLIT_PROOF_BUNDLE_MAGIC: &[u8] = b"midnight:zswap-split-proof-bundle:v1";
+const SPEND_SPLIT_KEY_LOCATION: &str = "midnight/zswap/spend-split";
+
+impl ZswapInputProof {
+    pub fn encode(self) -> Proof {
+        match self {
+            ZswapInputProof::Plain(proof) => proof,
+            ZswapInputProof::Split(bundle) => bundle.encode(),
+        }
+    }
+
+    pub fn decode(proof: &Proof) -> Result<Self, MalformedSplitProofBundle> {
+        if !proof.0.starts_with(SPLIT_PROOF_BUNDLE_MAGIC) {
+            return Ok(ZswapInputProof::Plain(proof.clone()));
+        }
+        SplitProofBundle::decode(proof).map(ZswapInputProof::Split)
+    }
+}
+
+impl SplitProofBundle {
+    pub fn new(
+        spend_proof: Proof,
+        split_public_inputs: SplitPublicInputs,
+        client_derivation_proof: Proof,
+    ) -> Self {
+        SplitProofBundle {
+            spend_proof,
+            split_public_inputs,
+            client_derivation_proof,
+        }
+    }
+
+    pub fn encode(self) -> Proof {
+        let mut bytes = Vec::with_capacity(
+            SPLIT_PROOF_BUNDLE_MAGIC.len()
+                + 4
+                + self.spend_proof.0.len()
+                + 4
+                + self.client_derivation_proof.0.len()
+                + 96,
+        );
+        bytes.extend_from_slice(SPLIT_PROOF_BUNDLE_MAGIC);
+        append_len_prefixed(&mut bytes, &self.spend_proof.0);
+        append_len_prefixed(&mut bytes, &self.client_derivation_proof.0);
+        bytes.extend_from_slice(&self.split_public_inputs.sk_commitment.as_le_bytes());
+        bytes.extend_from_slice(&self.split_public_inputs.public_key.0.0);
+        bytes.extend_from_slice(&self.split_public_inputs.coin_commitment.0.0);
+        Proof(bytes)
+    }
+
+    fn decode(proof: &Proof) -> Result<Self, MalformedSplitProofBundle> {
+        let mut remaining = proof.0.as_slice();
+        remaining = remaining
+            .strip_prefix(SPLIT_PROOF_BUNDLE_MAGIC)
+            .ok_or(MalformedSplitProofBundle)?;
+        let spend_proof = Proof(
+            read_len_prefixed(&mut remaining)
+                .ok_or(MalformedSplitProofBundle)?
+                .to_vec(),
+        );
+        let client_derivation_proof = Proof(
+            read_len_prefixed(&mut remaining)
+                .ok_or(MalformedSplitProofBundle)?
+                .to_vec(),
+        );
+        let sk_commitment =
+            Fr::from_le_bytes(read_exact(&mut remaining, 32).ok_or(MalformedSplitProofBundle)?)
+                .ok_or(MalformedSplitProofBundle)?;
+        let public_key = CoinPublicKey(HashOutput(
+            read_exact_array(&mut remaining).ok_or(MalformedSplitProofBundle)?,
+        ));
+        let coin_commitment = Commitment(HashOutput(
+            read_exact_array(&mut remaining).ok_or(MalformedSplitProofBundle)?,
+        ));
+        if !remaining.is_empty() {
+            return Err(MalformedSplitProofBundle);
+        }
+        Ok(SplitProofBundle {
+            spend_proof,
+            split_public_inputs: SplitPublicInputs {
+                sk_commitment,
+                public_key,
+                coin_commitment,
+            },
+            client_derivation_proof,
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct SplitInput<D: DB> {
+    pub input: Input<ProofPreimage, D>,
+    pub split_public_inputs: SplitPublicInputs,
+    pub client_derivation_proof: Proof,
+}
+
+impl<D: DB> SplitInput<D> {
+    pub fn into_preimage(self) -> Input<ProofPreimage, D> {
+        self.input
+    }
+
+    pub fn into_proved_input(self, spend_proof: Proof) -> Input<Proof, D> {
+        let proof = ZswapInputProof::Split(SplitProofBundle::new(
+            spend_proof,
+            self.split_public_inputs,
+            self.client_derivation_proof,
+        ))
+        .encode();
+        Input {
+            nullifier: self.input.nullifier,
+            value_commitment: self.input.value_commitment,
+            contract_address: self.input.contract_address,
+            merkle_tree_root: self.input.merkle_tree_root,
+            proof: Arc::new(proof),
+        }
+    }
+}
+
+fn append_len_prefixed(bytes: &mut Vec<u8>, value: &[u8]) {
+    let len = u32::try_from(value.len()).expect("proof is too large to bundle");
+    bytes.extend_from_slice(&len.to_le_bytes());
+    bytes.extend_from_slice(value);
+}
+
+fn read_len_prefixed<'a>(remaining: &mut &'a [u8]) -> Option<&'a [u8]> {
+    let len = u32::from_le_bytes(read_exact_array(remaining)?) as usize;
+    read_exact(remaining, len)
+}
+
+fn read_exact<'a>(remaining: &mut &'a [u8], len: usize) -> Option<&'a [u8]> {
+    if remaining.len() < len {
+        return None;
+    }
+    let (head, tail) = remaining.split_at(len);
+    *remaining = tail;
+    Some(head)
+}
+
+fn read_exact_array<const N: usize>(remaining: &mut &[u8]) -> Option<[u8; N]> {
+    read_exact(remaining, N)?.try_into().ok()
+}
+
 impl<P> Debug for AuthorizedClaim<P> {
     fn fmt(&self, formatter: &mut Formatter) -> fmt::Result {
         write!(
@@ -264,14 +433,32 @@ impl<P: Storable<D>, D: DB> Input<P, D> {
 }
 
 impl<D: DB> Input<ProofPreimage, D> {
+    fn public_witness_trailer_len(&self) -> usize {
+        if self.proof.key_location.0.as_ref() == SPEND_SPLIT_KEY_LOCATION {
+            Commitment::FIELD_SIZE + Nullifier::FIELD_SIZE
+        } else {
+            0
+        }
+    }
+
+    fn binding_randomness_index(&self) -> usize {
+        self.proof
+            .inputs
+            .len()
+            .checked_sub(self.public_witness_trailer_len() + 1)
+            .expect("must have witness to extract from")
+    }
+
     pub fn delta(&self) -> Delta {
         // NOTE: This is tied to the implementation in construct.rs
-        // Input before last is CoinInfo
+        // CoinInfo is immediately before rc.
         let inputs = &self.proof.inputs;
-        let coin = CoinInfo::from_field_repr(
-            &inputs[inputs.len() - 1 - CoinInfo::FIELD_SIZE..inputs.len() - 1],
-        )
-        .expect("coin info must be correct encoded in input preimage");
+        let coin_end = self.binding_randomness_index();
+        let coin_start = coin_end
+            .checked_sub(CoinInfo::FIELD_SIZE)
+            .expect("must have coin info witness to extract from");
+        let coin = CoinInfo::from_field_repr(&inputs[coin_start..coin_end])
+            .expect("coin info must be correct encoded in input preimage");
         Delta {
             token_type: coin.type_,
             value: coin.value.try_into().unwrap_or(i128::MAX),
@@ -280,14 +467,10 @@ impl<D: DB> Input<ProofPreimage, D> {
 
     pub fn binding_randomness(&self) -> PedersenRandomness {
         // NOTE: This is tied to the implementation in construct.rs
-        // rc is the last input, and should be a single Fr element.
-        (*self
-            .proof
-            .inputs
-            .last()
-            .expect("must have witness to extract from"))
-        .try_into()
-        .expect("extracted binding randomness is invalid")
+        // rc should be a single Fr element.
+        self.proof.inputs[self.binding_randomness_index()]
+            .try_into()
+            .expect("extracted binding randomness is invalid")
     }
 }
 
@@ -648,6 +831,7 @@ impl Debug for Symbol {
 
 pub const INPUT_PIS: usize = 68;
 pub const INPUT_PROOF_SIZE: usize = 4_832;
+pub const CLIENT_DERIVATION_PIS: usize = 48;
 pub const OUTPUT_PIS: usize = 77;
 pub const OUTPUT_PROOF_SIZE: usize = 4_832;
 pub const AUTHORIZED_CLAIM_PIS: usize = 13;

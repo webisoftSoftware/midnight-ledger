@@ -375,6 +375,7 @@ pub trait ProofKind<D: DB>: Ord + Storable<D> + Serializable + Deserializable + 
     fn zswap_claim_well_formed(
         claim: &zswap::AuthorizedClaim<Self::LatestProof>,
     ) -> Result<(), MalformedOffer>;
+    fn zswap_client_derivation_proofs(offer: &zswap::Offer<Self::LatestProof, D>) -> usize;
     #[allow(clippy::result_large_err)]
     fn proof_verify(
         op: &ContractOperation,
@@ -420,6 +421,18 @@ impl<D: DB> ProofKind<D> for ProofMarker {
         claim: &zswap::AuthorizedClaim<Self::LatestProof>,
     ) -> Result<(), MalformedOffer> {
         claim.well_formed()
+    }
+    fn zswap_client_derivation_proofs(offer: &zswap::Offer<Self::LatestProof, D>) -> usize {
+        offer
+            .inputs
+            .iter()
+            .filter(|input| {
+                matches!(
+                    zswap::ZswapInputProof::decode(input.proof.as_ref()),
+                    Ok(zswap::ZswapInputProof::Split(_))
+                )
+            })
+            .count()
     }
     #[cfg(not(feature = "proof-verifying"))]
     fn proof_verify(
@@ -520,6 +533,9 @@ impl<D: DB> ProofKind<D> for ProofPreimageMarker {
     ) -> Result<(), MalformedOffer> {
         Ok(())
     }
+    fn zswap_client_derivation_proofs(_: &zswap::Offer<Self::LatestProof, D>) -> usize {
+        0
+    }
     fn proof_verify(
         _: &ContractOperation,
         _: &Self::Proof,
@@ -562,6 +578,9 @@ impl<D: DB> ProofKind<D> for () {
         _: &zswap::AuthorizedClaim<Self::LatestProof>,
     ) -> Result<(), MalformedOffer> {
         Ok(())
+    }
+    fn zswap_client_derivation_proofs(_: &zswap::Offer<Self::LatestProof, D>) -> usize {
+        0
     }
     fn proof_verify(
         _: &ContractOperation,
@@ -1858,7 +1877,12 @@ where
                     .iter()
                     .map(|offer| offer.outputs.len() + offer.transient.len())
                     .sum::<usize>();
+                let split_zswap_inputs = offers
+                    .iter()
+                    .map(P::zswap_client_derivation_proofs)
+                    .sum::<usize>();
                 cost += model.proof_verify(zswap::INPUT_PIS) * zswap_inputs;
+                cost += model.proof_verify(zswap::CLIENT_DERIVATION_PIS) * split_zswap_inputs;
                 cost += model.proof_verify(zswap::OUTPUT_PIS) * zswap_outputs;
                 for intent in stx.intents.values() {
                     // Binding commitment check

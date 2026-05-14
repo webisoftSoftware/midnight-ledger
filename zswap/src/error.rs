@@ -48,6 +48,9 @@ impl Error for TransactionInvalid {}
 #[derive(Debug)]
 pub enum MalformedOffer {
     InvalidProof(VerifyingError),
+    MissingSplitPublicInputs,
+    MissingClientDerivationProof,
+    MalformedSplitProofBundle,
     ContractSentCiphertext {
         address: ContractAddress,
         ciphertext: Box<CoinCiphertext>,
@@ -63,6 +66,21 @@ impl Display for MalformedOffer {
             InvalidProof(err) => {
                 err.fmt(formatter)?;
                 write!(formatter, " -- while verifying Zswap proof")
+            }
+            MissingSplitPublicInputs => {
+                write!(
+                    formatter,
+                    "split Zswap input is missing shared public inputs"
+                )
+            }
+            MissingClientDerivationProof => {
+                write!(
+                    formatter,
+                    "split Zswap input is missing client derivation proof"
+                )
+            }
+            MalformedSplitProofBundle => {
+                write!(formatter, "split Zswap input proof bundle is malformed")
             }
             ContractSentCiphertext { address, .. } => write!(
                 formatter,

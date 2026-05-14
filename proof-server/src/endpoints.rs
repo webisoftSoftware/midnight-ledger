@@ -58,6 +58,7 @@ use transient_crypto::repr::FieldRepr;
 
 use zkir as zkir_v2;
 use zswap::Input;
+use zswap::error::MalformedOffer;
 use zswap::ledger::State as ZswapLedgerState;
 use zswap::prove::ZswapResolver;
 
@@ -225,18 +226,28 @@ pub(crate) async fn prove_split_spend(
         verify_client_derivation_proof(&request, sk_commitment, pk, commitment_hash, nullifier)
             .await?;
     }
+    let client_derivation_proof = request
+        .client_derivation_proof
+        .as_deref()
+        .map(bytes_from_hex)
+        .transpose()?
+        .map(Proof)
+        .ok_or_else(|| ErrorBadRequest(MalformedOffer::MissingClientDerivationProof.to_string()))?;
 
-    let input = Input::new_split(
+    let split_input = Input::new_split(
         &mut OsRng,
         &coin,
         None,
         nullifier,
         commitment_hash,
         sk_commitment,
+        pk,
+        client_derivation_proof,
         contract_address,
         &tree,
     )
     .map_err(|e| ErrorBadRequest(format!("build split spend preimage: {e:?}")))?;
+    let input = &split_input.input;
 
     let first_input = input
         .proof
@@ -310,19 +321,17 @@ pub(crate) async fn prove_split_spend(
                         ));
                     }
                 };
-                let proved_input = Input {
-                    nullifier: input.nullifier,
-                    value_commitment: input.value_commitment,
-                    contract_address: input.contract_address.clone(),
-                    merkle_tree_root: input.merkle_tree_root,
-                    proof: Arc::new(proof),
-                };
+                let proved_input = split_input.clone().into_proved_input(proof);
+                let proof = (*proved_input.proof).clone();
+                let mut proof_bytes = Vec::new();
+                tagged_serialize(&ProofVersioned::V2(proof), &mut proof_bytes)
+                    .map_err(|e| ErrorBadRequest(format!("serialize bundled proof: {e}")))?;
                 let mut proved_input_bytes = Vec::new();
                 tagged_serialize(&proved_input, &mut proved_input_bytes).map_err(|e| {
                     ErrorBadRequest(format!("serialize proved split spend input: {e}"))
                 })?;
                 (
-                    Some(bytes.encode_hex()),
+                    Some(proof_bytes.encode_hex()),
                     Some(proved_input_bytes.encode_hex()),
                     None,
                 )

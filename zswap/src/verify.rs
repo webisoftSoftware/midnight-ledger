@@ -29,7 +29,7 @@ use storage::db::DB;
 use storage::db::InMemoryDB;
 use storage::{Storable, arena::Sp};
 use transient_crypto::commitment::Pedersen;
-use transient_crypto::curve::{EmbeddedFr, EmbeddedGroupAffine};
+use transient_crypto::curve::{EmbeddedFr, EmbeddedGroupAffine, Fr};
 #[cfg(feature = "proof-verifying")]
 use transient_crypto::hash::transient_commit;
 use transient_crypto::proofs::PARAMS_VERIFIER;
@@ -61,6 +61,8 @@ const SPEND_VK_RAW: &[u8] = include_bytes!("../static/spend.verifier");
 #[cfg(feature = "proof-verifying")]
 const SPEND_SPLIT_VK_RAW: &[u8] = include_bytes!("../static/spend-split.verifier");
 #[cfg(feature = "proof-verifying")]
+const CLIENT_DERIVATION_VK_RAW: &[u8] = include_bytes!("../static/client-derivation.verifier");
+#[cfg(feature = "proof-verifying")]
 const SIGN_VK_RAW: &[u8] = include_bytes!("../static/sign.verifier");
 #[cfg(feature = "proof-verifying")]
 const SIGN_SPLIT_VK_RAW: &[u8] = include_bytes!("../static/sign-split.verifier");
@@ -76,6 +78,9 @@ lazy_static! {
     pub static ref SPEND_SPLIT_VK: VerifierKey =
         tagged_deserialize(&mut SPEND_SPLIT_VK_RAW.to_vec().as_slice())
             .expect("Zswap Split Spend VK should be valid");
+    pub static ref CLIENT_DERIVATION_VK: VerifierKey =
+        tagged_deserialize(&mut CLIENT_DERIVATION_VK_RAW.to_vec().as_slice())
+            .expect("Zswap Client Derivation VK should be valid");
     pub static ref SIGN_VK: VerifierKey = tagged_deserialize(&mut SIGN_VK_RAW.to_vec().as_slice())
         .expect("Zswap Sign VK should be valid");
     pub static ref SIGN_SPLIT_VK: VerifierKey =
@@ -168,6 +173,13 @@ impl<D: DB> Input<Proof, D> {
     #[instrument]
     #[cfg(feature = "proof-verifying")]
     pub fn well_formed(&self, segment: u16) -> Result<(), MalformedOffer> {
+        let input_proof = ZswapInputProof::decode(&self.proof)
+            .map_err(|_| MalformedOffer::MalformedSplitProofBundle)?;
+
+        if let ZswapInputProof::Split(split_bundle) = input_proof {
+            return self.split_well_formed(segment, &split_bundle);
+        }
+
         let mut prog = Vec::new();
         prog.extend::<[Op<ResultModeGather, InMemoryDB>; 6]>(HistoricMerkleTree_check_root!(
             [Key::Value(0u8.into())],
@@ -202,12 +214,23 @@ impl<D: DB> Input<Proof, D> {
         for op in with_outputs(prog.into_iter(), [true.into(), segment.into()].into_iter()) {
             op.field_repr(&mut statement);
         }
-        if SPEND_VK
+        SPEND_VK
             .verify(&PARAMS_VERIFIER, &self.proof, statement.iter().copied())
-            .is_ok()
-        {
-            return Ok(());
-        }
+            .map_err(MalformedOffer::InvalidProof)
+    }
+
+    #[cfg(feature = "proof-verifying")]
+    fn split_well_formed(
+        &self,
+        segment: u16,
+        split_bundle: &SplitProofBundle,
+    ) -> Result<(), MalformedOffer> {
+        let split = &split_bundle.split_public_inputs;
+        verify_client_derivation_proof(
+            split,
+            &split_bundle.client_derivation_proof,
+            self.nullifier,
+        )?;
 
         let mut split_prog = Vec::new();
         split_prog.extend::<[Op<ResultModeGather, InMemoryDB>; 6]>(HistoricMerkleTree_check_root!(
@@ -216,6 +239,12 @@ impl<D: DB> Input<Proof, D> {
             32,
             [u8; 32],
             self.merkle_tree_root
+        ));
+        split_prog.extend(Cell_write!(
+            [Key::Value(5u8.into())],
+            false,
+            [u8; 32],
+            split.coin_commitment.0.0
         ));
         split_prog.extend(Set_insert!(
             [Key::Value(1u8.into())],
@@ -231,7 +260,7 @@ impl<D: DB> Input<Proof, D> {
                 *addr.deref()
             ));
         }
-        split_prog.extend(Cell_read!([Key::Value(5u8.into())], false, u16));
+        split_prog.extend(Cell_read!([Key::Value(6u8.into())], false, u16));
         split_prog.extend(Cell_write!(
             [Key::Value(2u8.into())],
             false,
@@ -248,10 +277,67 @@ impl<D: DB> Input<Proof, D> {
         SPEND_SPLIT_VK
             .verify(
                 &PARAMS_VERIFIER,
-                &self.proof,
+                &split_bundle.spend_proof,
                 split_statement.iter().copied(),
             )
             .map_err(MalformedOffer::InvalidProof)
+    }
+}
+
+#[cfg(feature = "proof-verifying")]
+fn verify_client_derivation_proof(
+    split: &SplitPublicInputs,
+    proof: &Proof,
+    nullifier: coin_structure::coin::Nullifier,
+) -> Result<(), MalformedOffer> {
+    let mut statement = vec![Fr::from(0u64)];
+    statement.extend(client_derivation_public_transcript_inputs(
+        split.sk_commitment,
+        split.public_key,
+        split.coin_commitment.0.0,
+        nullifier.0.0,
+    ));
+    CLIENT_DERIVATION_VK
+        .verify(&PARAMS_VERIFIER, proof, statement.into_iter())
+        .map_err(MalformedOffer::InvalidProof)
+}
+
+#[cfg(feature = "proof-verifying")]
+fn client_derivation_public_transcript_inputs(
+    sk_commitment: Fr,
+    pk: coin_structure::coin::PublicKey,
+    commitment_hash: [u8; 32],
+    nullifier: [u8; 32],
+) -> Vec<Fr> {
+    let mut inputs = Vec::new();
+    extend_ops(
+        &mut inputs,
+        Cell_write!([Key::Value(0u8.into())], false, Fr, sk_commitment),
+    );
+    extend_ops(
+        &mut inputs,
+        Cell_write!(
+            [Key::Value(1u8.into())],
+            false,
+            coin_structure::coin::PublicKey,
+            pk
+        ),
+    );
+    extend_ops(
+        &mut inputs,
+        Cell_write!([Key::Value(2u8.into())], false, [u8; 32], commitment_hash),
+    );
+    extend_ops(
+        &mut inputs,
+        Cell_write!([Key::Value(3u8.into())], false, [u8; 32], nullifier),
+    );
+    inputs
+}
+
+#[cfg(feature = "proof-verifying")]
+fn extend_ops<const N: usize>(inputs: &mut Vec<Fr>, ops: [Op<ResultModeVerify, InMemoryDB>; N]) {
+    for op in filter_invalid(ops.into_iter()) {
+        op.field_repr(inputs);
     }
 }
 
