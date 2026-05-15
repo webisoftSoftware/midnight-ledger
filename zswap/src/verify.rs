@@ -63,6 +63,8 @@ const SPEND_SPLIT_VK_RAW: &[u8] = include_bytes!("../static/spend-split.verifier
 #[cfg(feature = "proof-verifying")]
 const CLIENT_DERIVATION_VK_RAW: &[u8] = include_bytes!("../static/client-derivation.verifier");
 #[cfg(feature = "proof-verifying")]
+const WALLET_ATTESTATION_VK_RAW: &[u8] = include_bytes!("../static/wallet-attestation.verifier");
+#[cfg(feature = "proof-verifying")]
 const SIGN_VK_RAW: &[u8] = include_bytes!("../static/sign.verifier");
 #[cfg(feature = "proof-verifying")]
 const SIGN_SPLIT_VK_RAW: &[u8] = include_bytes!("../static/sign-split.verifier");
@@ -81,6 +83,9 @@ lazy_static! {
     pub static ref CLIENT_DERIVATION_VK: VerifierKey =
         tagged_deserialize(&mut CLIENT_DERIVATION_VK_RAW.to_vec().as_slice())
             .expect("Zswap Client Derivation VK should be valid");
+    pub static ref WALLET_ATTESTATION_VK: VerifierKey =
+        tagged_deserialize(&mut WALLET_ATTESTATION_VK_RAW.to_vec().as_slice())
+            .expect("Zswap Wallet Attestation VK should be valid");
     pub static ref SIGN_VK: VerifierKey = tagged_deserialize(&mut SIGN_VK_RAW.to_vec().as_slice())
         .expect("Zswap Sign VK should be valid");
     pub static ref SIGN_SPLIT_VK: VerifierKey =
@@ -226,6 +231,24 @@ impl<D: DB> Input<Proof, D> {
         split_bundle: &SplitProofBundle,
     ) -> Result<(), MalformedOffer> {
         let split = &split_bundle.split_public_inputs;
+        // v3 admission chain (plain Rust verification, no recursion in-circuit):
+        //   (i)  attestation proof → asserts `pk == H(sk) ∧ C_sk == H(sk, r)`
+        //        (Plan §"Soundness argument" step 1)
+        //   (ii) client-derivation proof → opens `C_sk` to recover `sk`, then
+        //        computes the canonical nullifier and coin-binding tag from
+        //        that `sk` (Plan §"Soundness argument" steps 3–5)
+        //   (iii) cross-checks across the two proofs:
+        //        - both disclose the same `pk` (re-used as
+        //          `split.public_key` here),
+        //        - both disclose the same `commitment_sk` (re-used as
+        //          `split.commitment_sk` here),
+        //        which together force `sk` to be the same byte string on both
+        //        sides under Poseidon binding (Plan §"Encoding pitfall").
+        verify_wallet_attestation_proof(
+            split.public_key,
+            split.commitment_sk,
+            &split_bundle.attestation_proof,
+        )?;
         verify_client_derivation_proof(
             split,
             &split_bundle.client_derivation_proof,
@@ -301,6 +324,7 @@ fn verify_client_derivation_proof(
         split.public_key,
         nullifier.0.0,
         split.coin_binding_tag,
+        split.commitment_sk,
     ));
     CLIENT_DERIVATION_VK
         .verify(&PARAMS_VERIFIER, proof, statement.into_iter())
@@ -308,10 +332,51 @@ fn verify_client_derivation_proof(
 }
 
 #[cfg(feature = "proof-verifying")]
+fn verify_wallet_attestation_proof(
+    pk: coin_structure::coin::PublicKey,
+    commitment_sk: Fr,
+    proof: &Proof,
+) -> Result<(), MalformedOffer> {
+    let mut statement = vec![Fr::from(0u64)];
+    statement.extend(wallet_attestation_public_transcript_inputs(
+        pk,
+        commitment_sk,
+    ));
+    WALLET_ATTESTATION_VK
+        .verify(&PARAMS_VERIFIER, proof, statement.into_iter())
+        .map_err(MalformedOffer::InvalidProof)
+}
+
+/// Mirror of the public-input cells declared by
+/// `circuits/wallet_attestation.compact`: cell 0 → `pk`, cell 1 → `commitmentSk`.
+#[cfg(feature = "proof-verifying")]
+fn wallet_attestation_public_transcript_inputs(
+    pk: coin_structure::coin::PublicKey,
+    commitment_sk: Fr,
+) -> Vec<Fr> {
+    let mut inputs = Vec::new();
+    extend_ops(
+        &mut inputs,
+        Cell_write!(
+            [Key::Value(0u8.into())],
+            false,
+            coin_structure::coin::PublicKey,
+            pk
+        ),
+    );
+    extend_ops(
+        &mut inputs,
+        Cell_write!([Key::Value(1u8.into())], false, Fr, commitment_sk),
+    );
+    inputs
+}
+
+#[cfg(feature = "proof-verifying")]
 fn client_derivation_public_transcript_inputs(
     pk: coin_structure::coin::PublicKey,
     nullifier: [u8; 32],
     coin_binding_tag: Fr,
+    commitment_sk: Fr,
 ) -> Vec<Fr> {
     let mut inputs = Vec::new();
     extend_ops(
@@ -330,6 +395,12 @@ fn client_derivation_public_transcript_inputs(
     extend_ops(
         &mut inputs,
         Cell_write!([Key::Value(2u8.into())], false, Fr, coin_binding_tag),
+    );
+    // v3 cell 3 — Poseidon commitment to sk; cross-checked against the
+    // attestation's public output.
+    extend_ops(
+        &mut inputs,
+        Cell_write!([Key::Value(3u8.into())], false, Fr, commitment_sk),
     );
     inputs
 }

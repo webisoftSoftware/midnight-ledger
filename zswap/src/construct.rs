@@ -257,6 +257,12 @@ impl<D: DB> Input<ProofPreimage, D> {
     }
 
     /// Split-prove: build spend preimage without raw sk.
+    ///
+    /// v3 additions: `commitment_sk` (Poseidon commit to `sk`) and
+    /// `attestation_proof` (one-time wallet attestation) are carried through
+    /// into the emitted bundle so the node admission verifier can re-check
+    /// `pk = persistentHash(sep, sk) ∧ C_sk = transientHash(sep', sk, r)`
+    /// without consulting any ledger state.
     pub fn new_split<A: Debug + Storable<D>, R: Rng + CryptoRng + ?Sized>(
         rng: &mut R,
         coin: &QualifiedCoinInfo,
@@ -265,7 +271,9 @@ impl<D: DB> Input<ProofPreimage, D> {
         commitment_hash: Commitment,
         pk: CoinPublicKey,
         coin_binding_tag: Fr,
+        commitment_sk: Fr,
         client_derivation_proof: Proof,
+        attestation_proof: Proof,
         is_contract: Option<ContractAddress>,
         tree: &MerkleTree<A, D>,
     ) -> Result<SplitInput<D>, OfferCreationFailed> {
@@ -364,8 +372,10 @@ impl<D: DB> Input<ProofPreimage, D> {
                 public_key: pk,
                 coin_commitment: commitment_hash,
                 coin_binding_tag,
+                commitment_sk,
             },
             client_derivation_proof,
+            attestation_proof,
         })
     }
 }

@@ -11,6 +11,7 @@ use onchain_runtime::ops::{Key, Op};
 use onchain_runtime::program_fragments::Cell_write;
 use onchain_runtime::result_mode::ResultModeVerify;
 use onchain_runtime::state::StateValue;
+use rand::Rng;
 use rand::rngs::OsRng;
 use serde_json::json;
 use serialize::{Deserializable, Tagged, tagged_deserialize, tagged_serialize};
@@ -39,6 +40,12 @@ use zswap::{Delta, Input, Offer as ZswapOffer, Output as ZswapOutput, split_coin
 
 pub type PreviewResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 const CLIENT_DERIVATION_KEY_LOCATION: &str = "split/client/sk-derivation";
+/// v3: one-time-per-wallet attestation circuit. Mirror of
+/// `split-prove-prototype::attestation::WALLET_ATTESTATION_KEY_LOCATION`.
+const WALLET_ATTESTATION_KEY_LOCATION: &str = "split/wallet/attestation";
+/// v3 Poseidon `C_sk` separator. Must match the immediate loaded in
+/// `circuits/wallet_attestation.compact` and `circuits/sk_proof.compact`.
+const SK_COMMIT_SEPARATOR: &str = "midnight:sk-commit[v1]";
 const DEFAULT_PREVIEW_TRANSFER_AMOUNT: u128 = 500 * 1_000_000;
 
 pub fn split_nullifier(coin: &CoinInfo, sk: &coin_structure::coin::SecretKey) -> Nullifier {
@@ -217,9 +224,11 @@ pub fn print_staged_report(report: &PreviewSplitProveReport) {
     println!();
     println!("--- Role boundary check ---");
     println!("  sk crossed the wire?                                    NO");
+    println!("  r (attestation blinding) crossed the wire?              NO");
     println!("  what crossed (ClientHandoff): coinBindingTag, nullifier, pk,");
     println!("                commitmentHash, coinValue, coinType, coinNonce,");
-    println!("                mtIndex, contractAddress, clientDerivationProof");
+    println!("                mtIndex, contractAddress, clientDerivationProof,");
+    println!("                attestedCommitmentSk, attestationProof");
     println!();
 }
 
@@ -499,9 +508,30 @@ pub async fn build_split_spend_handoff_timed(
     tagged_serialize(&spend.zswap_state, &mut zswap_state_bytes)?;
     let pk = spend.key.coin_secret_key.public_key();
     let coin_binding_tag = split_coin_binding_tag(&spend.coin, pk);
+
+    // v3: one-time wallet attestation. In a real wallet this is generated at
+    // registration time and reused across every spend; the preview e2e
+    // generates it fresh per run so the demo is self-contained.
+    let attestation_start = Instant::now();
+    let attestation = prove_wallet_attestation(&spend.key.coin_secret_key).await?;
+    let attestation_elapsed = attestation_start.elapsed();
+
+    debug_assert_eq!(attestation.pk, pk, "attestation pk must match the spend's pk");
+
     let proving_start = Instant::now();
-    let client_derivation_proof = prove_client_derivation(spend, coin_binding_tag, pk).await?;
-    let proving_elapsed = proving_start.elapsed();
+    let client_derivation_proof =
+        prove_client_derivation(spend, coin_binding_tag, pk, &attestation).await?;
+    let client_derivation_elapsed = proving_start.elapsed();
+
+    // The user-facing `derive_local_proving` timing counts only the per-spend
+    // client proof — the attestation is a one-time setup cost, not a per-spend
+    // proof, so we don't roll it in. We still log it so it's visible.
+    tracing::info!(
+        stage = "wallet-attestation",
+        role = "client",
+        elapsed_ms = attestation_elapsed.as_millis() as u64,
+        "✓ CLIENT/wallet-attestation (one-time)"
+    );
 
     Ok((
         json!({
@@ -517,8 +547,12 @@ pub async fn build_split_spend_handoff_timed(
             "zswapState": hex::encode(zswap_state_bytes),
             "prove": true,
             "clientDerivationProof": hex::encode(client_derivation_proof.0),
+            // v3 additions — required by the proof server's /v2/prove-split-spend
+            // endpoint and by the node admission verifier.
+            "attestedCommitmentSk": hex::encode(attestation.commitment_sk.0.to_bytes_le()),
+            "attestationProof": hex::encode(attestation.proof.0),
         }),
-        proving_elapsed,
+        client_derivation_elapsed,
     ))
 }
 
@@ -914,8 +948,9 @@ async fn prove_client_derivation(
     spend: &PreviewWalletSpend,
     coin_binding_tag: Fr,
     pk: CoinPublicKey,
+    attestation: &PreviewWalletAttestation,
 ) -> PreviewResult<transient_crypto::proofs::Proof> {
-    let preimage = build_client_derivation_preimage(spend, coin_binding_tag, pk);
+    let preimage = build_client_derivation_preimage(spend, coin_binding_tag, pk, attestation);
     let resolver = ClientDerivationResolver::new(ZswapResolver(
         MidnightDataProvider::new(
             FetchMode::OnDemand,
@@ -935,12 +970,17 @@ fn build_client_derivation_preimage(
     spend: &PreviewWalletSpend,
     coin_binding_tag: Fr,
     pk: CoinPublicKey,
+    attestation: &PreviewWalletAttestation,
 ) -> ProofPreimage {
+    // v3 witness layout matches `circuits/sk_proof.compact`'s parameter
+    // declaration order: (sk, pk, r, coin).
     let mut inputs = Vec::new();
-    spend.key.coin_secret_key.0.0.field_repr(&mut inputs);
-    spend.coin.nonce.0.0.field_repr(&mut inputs);
-    spend.coin.type_.0.0.field_repr(&mut inputs);
-    spend.coin.value.field_repr(&mut inputs);
+    spend.key.coin_secret_key.0.0.field_repr(&mut inputs); // sk → 2 Fr limbs
+    pk.0.0.field_repr(&mut inputs); // pk → 2 Fr limbs
+    inputs.push(attestation.blinding); // r → 1 Fr
+    spend.coin.nonce.0.0.field_repr(&mut inputs); // coin.nonce → 2 Fr limbs
+    spend.coin.type_.0.0.field_repr(&mut inputs); // coin.color → 2 Fr limbs
+    spend.coin.value.field_repr(&mut inputs); // coin.value → 1 Fr
 
     ProofPreimage {
         inputs,
@@ -949,6 +989,7 @@ fn build_client_derivation_preimage(
             pk,
             spend.nullifier.0.0,
             coin_binding_tag,
+            attestation.commitment_sk,
         ),
         public_transcript_outputs: Vec::new(),
         binding_input: 0.into(),
@@ -961,6 +1002,7 @@ fn client_derivation_public_transcript_inputs(
     pk: CoinPublicKey,
     nullifier: [u8; 32],
     coin_binding_tag: Fr,
+    commitment_sk: Fr,
 ) -> Vec<Fr> {
     let mut inputs = Vec::new();
     extend_ops(
@@ -975,7 +1017,114 @@ fn client_derivation_public_transcript_inputs(
         &mut inputs,
         Cell_write!([Key::Value(2u8.into())], false, Fr, coin_binding_tag),
     );
+    // v3 cell 3 — Poseidon C_sk; cross-checked by the admission verifier
+    // against the attestation's commitment_sk public output.
+    extend_ops(
+        &mut inputs,
+        Cell_write!([Key::Value(3u8.into())], false, Fr, commitment_sk),
+    );
     inputs
+}
+
+/// v3 wallet attestation produced once at the start of a preview run and
+/// reused for every spend in that run. Mirrors
+/// `split-prove-prototype::attestation::WalletAttestation`.
+#[derive(Debug, Clone)]
+pub(crate) struct PreviewWalletAttestation {
+    pub pk: CoinPublicKey,
+    pub commitment_sk: Fr,
+    pub blinding: Fr,
+    pub proof: Proof,
+}
+
+/// Off-circuit derivation of `(pk, C_sk)` from `(sk, r)`. Byte-identical to
+/// what the attestation circuit computes — Compact decomposes `Bytes<32>` into
+/// an 8-bit limb followed by a 248-bit limb, the same two Fr values
+/// `sk.0.0.field_repr()` produces here.
+fn derive_attestation_outputs(
+    sk: &coin_structure::coin::SecretKey,
+    r: Fr,
+) -> (CoinPublicKey, Fr) {
+    let pk = sk.public_key();
+    let mut sk_limbs = Vec::new();
+    sk.0.0.field_repr(&mut sk_limbs);
+    debug_assert_eq!(sk_limbs.len(), 2, "Bytes<32> must produce 2 Fr limbs");
+    let sep = ascii_to_fr_le(SK_COMMIT_SEPARATOR);
+    let commitment_sk = transient_crypto::hash::transient_hash(&[sep, sk_limbs[0], sk_limbs[1], r]);
+    (pk, commitment_sk)
+}
+
+fn ascii_to_fr_le(s: &str) -> Fr {
+    let bytes = s.as_bytes();
+    debug_assert!(bytes.len() <= 32, "domain separator too long for one Fr");
+    let mut buf = [0u8; 32];
+    buf[..bytes.len()].copy_from_slice(bytes);
+    Fr::from_le_bytes(&buf).expect("ascii fits in Fr")
+}
+
+fn build_wallet_attestation_preimage(
+    sk: &coin_structure::coin::SecretKey,
+    r: Fr,
+    pk: CoinPublicKey,
+    commitment_sk: Fr,
+) -> ProofPreimage {
+    let mut inputs = Vec::new();
+    sk.0.0.field_repr(&mut inputs);
+    inputs.push(r);
+    ProofPreimage {
+        inputs,
+        private_transcript: Vec::new(),
+        public_transcript_inputs: wallet_attestation_public_transcript_inputs(pk, commitment_sk),
+        public_transcript_outputs: Vec::new(),
+        binding_input: 0.into(),
+        communications_commitment: None,
+        key_location: KeyLocation(Cow::Borrowed(WALLET_ATTESTATION_KEY_LOCATION)),
+    }
+}
+
+fn wallet_attestation_public_transcript_inputs(
+    pk: CoinPublicKey,
+    commitment_sk: Fr,
+) -> Vec<Fr> {
+    let mut inputs = Vec::new();
+    extend_ops(
+        &mut inputs,
+        Cell_write!([Key::Value(0u8.into())], false, CoinPublicKey, pk),
+    );
+    extend_ops(
+        &mut inputs,
+        Cell_write!([Key::Value(1u8.into())], false, Fr, commitment_sk),
+    );
+    inputs
+}
+
+/// Generate the per-run wallet attestation. Live e2e runs this once per
+/// preview run and reuses the result on every spend; in real wallets this
+/// would happen once at setup and persist.
+pub(crate) async fn prove_wallet_attestation(
+    sk: &coin_structure::coin::SecretKey,
+) -> PreviewResult<PreviewWalletAttestation> {
+    let r: Fr = OsRng.r#gen();
+    let (pk, commitment_sk) = derive_attestation_outputs(sk, r);
+    let preimage = build_wallet_attestation_preimage(sk, r, pk, commitment_sk);
+    let resolver = ClientDerivationResolver::new(ZswapResolver(
+        MidnightDataProvider::new(
+            FetchMode::OnDemand,
+            OutputMode::Log,
+            zswap::ZSWAP_EXPECTED_FILES.to_vec(),
+        )
+        .map_err(|e| format!("data provider initialization failed: {e}"))?,
+    ));
+    let (proof, _) = preimage
+        .prove::<zkir::IrSource>(OsRng, &resolver, &resolver)
+        .await
+        .map_err(|e| format!("wallet attestation proof failed: {e}"))?;
+    Ok(PreviewWalletAttestation {
+        pk,
+        commitment_sk,
+        blinding: r,
+        proof,
+    })
 }
 
 fn extend_ops<const N: usize>(inputs: &mut Vec<Fr>, ops: [Op<ResultModeVerify, InMemoryDB>; N]) {
@@ -1007,6 +1156,8 @@ where
     async fn resolve_key(&self, key: KeyLocation) -> std::io::Result<Option<ProvingKeyMaterial>> {
         if key.0.as_ref() == CLIENT_DERIVATION_KEY_LOCATION {
             Ok(Some(client_derivation_proving_data()))
+        } else if key.0.as_ref() == WALLET_ATTESTATION_KEY_LOCATION {
+            Ok(Some(wallet_attestation_proving_data()))
         } else {
             self.params_and_fallback.resolve_key(key).await
         }
@@ -1032,6 +1183,23 @@ fn client_derivation_proving_data() -> ProvingKeyMaterial {
         .to_vec(),
         ir_source: include_bytes!("../../../../circuits/static/client-derivation/sk_prove.bzkir")
             .to_vec(),
+    }
+}
+
+fn wallet_attestation_proving_data() -> ProvingKeyMaterial {
+    ProvingKeyMaterial {
+        prover_key: include_bytes!(
+            "../../../../circuits/static/wallet-attestation/wallet_attest.prover"
+        )
+        .to_vec(),
+        verifier_key: include_bytes!(
+            "../../../../circuits/static/wallet-attestation/wallet_attest.verifier"
+        )
+        .to_vec(),
+        ir_source: include_bytes!(
+            "../../../../circuits/static/wallet-attestation/wallet_attest.bzkir"
+        )
+        .to_vec(),
     }
 }
 
