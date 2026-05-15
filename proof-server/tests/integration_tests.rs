@@ -727,7 +727,7 @@ mod split_spend_endpoint {
         let report = result.expect("preview split prove must succeed");
         print_staged_report(&report);
         eprintln!(
-            "split-sent preview output key_index={key_index} mt_index={mt_index} input_value={} transfer_value={} change_value={} token={} recipient={} status={} client_proof_ms={} server_proof_ms={} split_proof_total_ms={} server_client_ratio={} proof_len={} tx_hash={} tx_id={} tx_len={} well_formed={} inclusion={} block_hash={}",
+            "split-sent preview output key_index={key_index} mt_index={mt_index} input_value={} transfer_value={} change_value={} token={} recipient={} status={} client_proof_ms={} server_proof_ms={} split_proof_total_ms={} server_client_ratio={} proof_len={} tx_hash={} tx_id={} tx_len={} pre_submit_wasm_check={} inclusion={} block_hash={}",
             report.coin_value,
             report.transfer_value,
             report.change_value,
@@ -758,7 +758,7 @@ mod split_spend_endpoint {
             report.tx_hash,
             report.tx_id.as_deref().unwrap_or(""),
             report.tx_hex_len,
-            report.well_formed,
+            report.pre_submit_wasm_check,
             report.inclusion_status,
             report.block_hash,
             key_index = report.key_index,
@@ -784,9 +784,9 @@ mod split_spend_endpoint {
                 .is_some_and(|tx_id| !tx_id.is_empty())
         );
         assert!(
-            matches!(report.well_formed.as_str(), "ok" | "skipped"),
-            "pre-submit wellFormed must be ok or skipped; got {:?}; submission={}",
-            report.well_formed,
+            matches!(report.pre_submit_wasm_check.as_str(), "ok" | "skipped"),
+            "pre-submit wasm check must be ok or skipped; got {:?}; submission={}",
+            report.pre_submit_wasm_check,
             report.submission
         );
         assert!(

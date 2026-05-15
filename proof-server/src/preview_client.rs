@@ -107,7 +107,7 @@ pub struct PreviewSplitProveReport {
     pub tx_hex_len: usize,
     pub block_hash: String,
     pub inclusion_status: String,
-    pub well_formed: String,
+    pub pre_submit_wasm_check: String,
     pub response: serde_json::Value,
     pub submission: serde_json::Value,
     pub verification: serde_json::Value,
@@ -205,7 +205,10 @@ pub fn print_staged_report(report: &PreviewSplitProveReport) {
     println!("--- NODE + INDEXER ---");
     println!("  [6/6] submit     author_submitAndWatchExtrinsic          (bundled in [5/6])");
     println!("         inclusion_status:  {}", report.inclusion_status);
-    println!("         well_formed:       {}", report.well_formed);
+    println!(
+        "         pre_submit_wasm_check: {}",
+        report.pre_submit_wasm_check
+    );
     println!("         block_hash:        {}", report.block_hash);
     println!();
     println!("--- End-to-end context (not proof comparison) ---");
@@ -369,8 +372,9 @@ pub async fn prove_preview_wallet_split_spend(
             .as_str()
             .unwrap_or_default()
             .to_string(),
-        well_formed: submission["wellFormed"]
+        pre_submit_wasm_check: submission["preSubmitWasmCheck"]
             .as_str()
+            .or_else(|| submission["wellFormed"].as_str())
             .unwrap_or_default()
             .to_string(),
         response: body,
