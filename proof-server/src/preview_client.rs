@@ -516,7 +516,10 @@ pub async fn build_split_spend_handoff_timed(
     let attestation = prove_wallet_attestation(&spend.key.coin_secret_key).await?;
     let attestation_elapsed = attestation_start.elapsed();
 
-    debug_assert_eq!(attestation.pk, pk, "attestation pk must match the spend's pk");
+    debug_assert_eq!(
+        attestation.pk, pk,
+        "attestation pk must match the spend's pk"
+    );
 
     let proving_start = Instant::now();
     let client_derivation_proof =
@@ -1041,10 +1044,7 @@ pub(crate) struct PreviewWalletAttestation {
 /// what the attestation circuit computes — Compact decomposes `Bytes<32>` into
 /// an 8-bit limb followed by a 248-bit limb, the same two Fr values
 /// `sk.0.0.field_repr()` produces here.
-fn derive_attestation_outputs(
-    sk: &coin_structure::coin::SecretKey,
-    r: Fr,
-) -> (CoinPublicKey, Fr) {
+fn derive_attestation_outputs(sk: &coin_structure::coin::SecretKey, r: Fr) -> (CoinPublicKey, Fr) {
     let pk = sk.public_key();
     let mut sk_limbs = Vec::new();
     sk.0.0.field_repr(&mut sk_limbs);
@@ -1082,10 +1082,7 @@ fn build_wallet_attestation_preimage(
     }
 }
 
-fn wallet_attestation_public_transcript_inputs(
-    pk: CoinPublicKey,
-    commitment_sk: Fr,
-) -> Vec<Fr> {
+fn wallet_attestation_public_transcript_inputs(pk: CoinPublicKey, commitment_sk: Fr) -> Vec<Fr> {
     let mut inputs = Vec::new();
     extend_ops(
         &mut inputs,

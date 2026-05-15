@@ -626,6 +626,48 @@ mod split_spend_endpoint {
             .well_formed(0)
             .expect("ledger verifier accepts split input with both proofs");
 
+        let mut tampered_pk = proved_input.clone();
+        let mut tampered_pk_bundle = bundle.clone();
+        tampered_pk_bundle.split_public_inputs.public_key = coin::PublicKey(HashOutput([9u8; 32]));
+        tampered_pk.proof =
+            std::sync::Arc::new(ZswapInputProof::Split(tampered_pk_bundle).encode());
+        assert!(
+            tampered_pk.well_formed(0).is_err(),
+            "ledger verifier must reject a split bundle whose pk no longer matches the attestation/client proofs"
+        );
+
+        let mut tampered_commitment_sk = proved_input.clone();
+        let mut tampered_commitment_sk_bundle = bundle.clone();
+        tampered_commitment_sk_bundle
+            .split_public_inputs
+            .commitment_sk = if bundle.split_public_inputs.commitment_sk
+            == transient_crypto::curve::Fr::from(1u64)
+        {
+            transient_crypto::curve::Fr::from(2u64)
+        } else {
+            transient_crypto::curve::Fr::from(1u64)
+        };
+        tampered_commitment_sk.proof =
+            std::sync::Arc::new(ZswapInputProof::Split(tampered_commitment_sk_bundle).encode());
+        assert!(
+            tampered_commitment_sk.well_formed(0).is_err(),
+            "ledger verifier must reject a split bundle whose C_sk no longer matches the attestation/client proofs"
+        );
+
+        let mut tampered_attestation = proved_input.clone();
+        let mut tampered_attestation_bundle = bundle.clone();
+        assert!(
+            !tampered_attestation_bundle.attestation_proof.0.is_empty(),
+            "synthetic v3 bundle should carry a non-empty attestation proof"
+        );
+        tampered_attestation_bundle.attestation_proof.0[0] ^= 1;
+        tampered_attestation.proof =
+            std::sync::Arc::new(ZswapInputProof::Split(tampered_attestation_bundle).encode());
+        assert!(
+            tampered_attestation.well_formed(0).is_err(),
+            "ledger verifier must reject a split bundle with a corrupted attestation proof"
+        );
+
         let mut missing_client_proof = proved_input.clone();
         missing_client_proof.proof = std::sync::Arc::new(bundle.spend_proof.clone());
         assert!(missing_client_proof.well_formed(0).is_err());

@@ -266,9 +266,7 @@ pub(crate) async fn prove_split_spend(
         .map(fr_from_hex)
         .transpose()?
         .ok_or_else(|| {
-            ErrorBadRequest(
-                "attestedCommitmentSk is required for split spend proof requests (v3)",
-            )
+            ErrorBadRequest("attestedCommitmentSk is required for split spend proof requests (v3)")
         })?;
     let attestation_proof_hex = request.attestation_proof.as_deref().ok_or_else(|| {
         ErrorBadRequest("attestationProof is required for split spend proof requests (v3)")
@@ -540,13 +538,20 @@ async fn verify_attestation_proof(
     commitment_sk: Fr,
 ) -> Result<(), Error> {
     let proof = Proof(bytes_from_hex(attestation_proof_hex)?);
-    let verifier_key: VerifierKey = tagged_deserialize(
-        &include_bytes!("../../../../circuits/static/wallet-attestation/wallet_attest.verifier")
-            [..],
-    )
-    .map_err(|e| ErrorBadRequest(format!("deserialize wallet attestation verifier key: {e}")))?;
+    let verifier_key: VerifierKey =
+        tagged_deserialize(
+            &include_bytes!(
+                "../../../../circuits/static/wallet-attestation/wallet_attest.verifier"
+            )[..],
+        )
+        .map_err(|e| {
+            ErrorBadRequest(format!("deserialize wallet attestation verifier key: {e}"))
+        })?;
     let mut statement = vec![Fr::from(0u64)];
-    statement.extend(wallet_attestation_public_transcript_inputs(pk, commitment_sk));
+    statement.extend(wallet_attestation_public_transcript_inputs(
+        pk,
+        commitment_sk,
+    ));
     verifier_key
         .verify(&PARAMS_VERIFIER, &proof, statement.into_iter())
         .map_err(|e| ErrorBadRequest(format!("invalid wallet attestation proof: {e}")))
@@ -579,10 +584,7 @@ fn client_derivation_public_transcript_inputs(
     inputs
 }
 
-fn wallet_attestation_public_transcript_inputs(
-    pk: CoinPublicKey,
-    commitment_sk: Fr,
-) -> Vec<Fr> {
+fn wallet_attestation_public_transcript_inputs(pk: CoinPublicKey, commitment_sk: Fr) -> Vec<Fr> {
     let mut inputs = Vec::new();
     extend_ops(
         &mut inputs,
