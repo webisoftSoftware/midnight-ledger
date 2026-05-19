@@ -16,6 +16,12 @@ use crate::ciphertext_to_field;
 use crate::error::MalformedOffer;
 #[cfg(any(feature = "proof-verifying", test))]
 use crate::filter_invalid;
+#[cfg(feature = "proof-verifying")]
+use crate::split_wrapper::{
+    SPLIT_WRAPPER_K, SplitWrapperInnerKeys, SplitWrapperProofBundle, SplitWrapperVerifyingKey,
+    read_split_wrapper_verifying_key, split_wrapper_inner_keys, verify_split_wrapper,
+    wrapper_public_input_statement,
+};
 use crate::structure::*;
 #[cfg(feature = "proof-verifying")]
 use base_crypto::fab::AlignedValue;
@@ -68,6 +74,8 @@ const WALLET_ATTESTATION_VK_RAW: &[u8] = include_bytes!("../static/wallet-attest
 const SIGN_VK_RAW: &[u8] = include_bytes!("../static/sign.verifier");
 #[cfg(feature = "proof-verifying")]
 const SIGN_SPLIT_VK_RAW: &[u8] = include_bytes!("../static/sign-split.verifier");
+#[cfg(feature = "proof-verifying")]
+const SPEND_SPLIT_WRAPPER_VK_RAW: &[u8] = include_bytes!("../static/spend-split-wrapper.verifier");
 
 #[cfg(feature = "proof-verifying")]
 lazy_static! {
@@ -91,6 +99,18 @@ lazy_static! {
     pub static ref SIGN_SPLIT_VK: VerifierKey =
         tagged_deserialize(&mut SIGN_SPLIT_VK_RAW.to_vec().as_slice())
             .expect("Zswap Split Sign VK should be valid");
+    pub static ref SPEND_SPLIT_WRAPPER_VK: SplitWrapperVerifyingKey =
+        read_split_wrapper_verifying_key(SPEND_SPLIT_WRAPPER_VK_RAW)
+            .expect("Zswap Split Wrapper VK should be valid");
+    pub static ref SPLIT_WRAPPER_PARAMS_VERIFIER: ParamsVerifier =
+        ParamsVerifier::read_cached_prover(SPLIT_WRAPPER_K)
+            .expect("Zswap Split Wrapper verifier params should be valid");
+    pub static ref SPLIT_WRAPPER_INNER_KEYS: SplitWrapperInnerKeys = split_wrapper_inner_keys(
+        &WALLET_ATTESTATION_VK,
+        &CLIENT_DERIVATION_VK,
+        &SPEND_SPLIT_VK,
+    )
+    .expect("Zswap Split Wrapper inner verifier keys should be valid");
 }
 
 #[cfg(feature = "proof-verifying")]
@@ -181,8 +201,14 @@ impl<D: DB> Input<Proof, D> {
         let input_proof = ZswapInputProof::decode(&self.proof)
             .map_err(|_| MalformedOffer::MalformedSplitProofBundle)?;
 
-        if let ZswapInputProof::Split(split_bundle) = input_proof {
-            return self.split_well_formed(segment, &split_bundle);
+        match input_proof {
+            ZswapInputProof::SplitWrapped(split_bundle) => {
+                return self.split_wrapper_well_formed(segment, &split_bundle);
+            }
+            ZswapInputProof::Split(_) => {
+                return Err(MalformedOffer::MalformedSplitProofBundle);
+            }
+            ZswapInputProof::Plain(_) => {}
         }
 
         let mut prog = Vec::new();
@@ -225,6 +251,7 @@ impl<D: DB> Input<Proof, D> {
     }
 
     #[cfg(feature = "proof-verifying")]
+    #[allow(dead_code)]
     fn split_well_formed(
         &self,
         segment: u16,
@@ -311,9 +338,31 @@ impl<D: DB> Input<Proof, D> {
             )
             .map_err(MalformedOffer::InvalidProof)
     }
+
+    #[cfg(feature = "proof-verifying")]
+    fn split_wrapper_well_formed(
+        &self,
+        segment: u16,
+        split_bundle: &SplitWrapperProofBundle,
+    ) -> Result<(), MalformedOffer> {
+        if self.contract_address.is_some() {
+            return Err(MalformedOffer::MalformedSplitProofBundle);
+        }
+        let public_inputs = wrapper_public_input_statement(self, segment);
+        verify_split_wrapper(
+            &SPLIT_WRAPPER_PARAMS_VERIFIER,
+            &PARAMS_VERIFIER,
+            &SPEND_SPLIT_WRAPPER_VK,
+            &SPLIT_WRAPPER_INNER_KEYS,
+            &public_inputs,
+            split_bundle,
+        )
+        .map_err(|err| MalformedOffer::InvalidProof(anyhow::anyhow!(err.to_string())))
+    }
 }
 
 #[cfg(feature = "proof-verifying")]
+#[allow(dead_code)]
 fn verify_client_derivation_proof(
     split: &SplitPublicInputs,
     proof: &Proof,
@@ -332,6 +381,7 @@ fn verify_client_derivation_proof(
 }
 
 #[cfg(feature = "proof-verifying")]
+#[allow(dead_code)]
 fn verify_wallet_attestation_proof(
     pk: coin_structure::coin::PublicKey,
     commitment_sk: Fr,
@@ -350,6 +400,7 @@ fn verify_wallet_attestation_proof(
 /// Mirror of the public-input cells declared by
 /// `circuits/wallet_attestation.compact`: cell 0 → `pk`, cell 1 → `commitmentSk`.
 #[cfg(feature = "proof-verifying")]
+#[allow(dead_code)]
 fn wallet_attestation_public_transcript_inputs(
     pk: coin_structure::coin::PublicKey,
     commitment_sk: Fr,
@@ -372,6 +423,7 @@ fn wallet_attestation_public_transcript_inputs(
 }
 
 #[cfg(feature = "proof-verifying")]
+#[allow(dead_code)]
 fn client_derivation_public_transcript_inputs(
     pk: coin_structure::coin::PublicKey,
     nullifier: [u8; 32],
@@ -406,6 +458,7 @@ fn client_derivation_public_transcript_inputs(
 }
 
 #[cfg(feature = "proof-verifying")]
+#[allow(dead_code)]
 fn extend_ops<const N: usize>(inputs: &mut Vec<Fr>, ops: [Op<ResultModeVerify, InMemoryDB>; N]) {
     for op in filter_invalid(ops.into_iter()) {
         op.field_repr(inputs);

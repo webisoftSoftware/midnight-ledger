@@ -567,7 +567,7 @@ mod split_spend_endpoint {
         assert!(handoff["skCommitment"].is_null());
         assert!(handoff["clientDerivationProof"].as_str().is_some());
 
-        let response = build_client(180)
+        let response = build_client(900)
             .post(format!("{}/v2/prove-split-spend", server.base_url()))
             .json(&handoff)
             .send()
@@ -577,7 +577,8 @@ mod split_spend_endpoint {
         let status = response.status();
         let body: serde_json::Value = response.json().await.expect("split response JSON");
         assert_eq!(status, 200, "unexpected split response: {body}");
-        assert_eq!(body["status"], "proofBuilt");
+        assert_eq!(body["status"], "proofBuilt", "unexpected split response: {body}");
+        assert_eq!(body["proofVersion"], "split-wrapper-v4");
         assert_eq!(body["merklePathSource"], "zswapState");
         assert!(body["proofError"].is_null());
         assert!(
@@ -612,81 +613,57 @@ mod split_spend_endpoint {
         let bundle = match ZswapInputProof::decode(&proved_input.proof)
             .expect("proved input proof envelope decodes")
         {
-            ZswapInputProof::Split(bundle) => bundle,
-            ZswapInputProof::Plain(_) => panic!("proved input must carry split proof envelope"),
+            ZswapInputProof::SplitWrapped(bundle) => bundle,
+            ZswapInputProof::Plain(_) | ZswapInputProof::Split(_) => {
+                panic!("proved input must carry v4 split wrapper envelope")
+            }
         };
-        let expected_tag = zswap::split_coin_binding_tag(&spend.coin, spend.key.coin_public_key());
-        assert_eq!(bundle.split_public_inputs.coin_commitment, spend.commitment);
-        assert_eq!(
-            bundle.split_public_inputs.public_key,
-            spend.key.coin_public_key()
+        assert!(!bundle.wrapper_proof.0.is_empty());
+        assert!(!bundle.aggregate_accumulator.is_empty());
+        assert!(
+            !proved_input
+                .proof
+                .0
+                .windows(32)
+                .any(|window| window == spend.key.coin_public_key().0.0),
+            "v4 envelope must not expose pk as a public bundle field"
         );
-        assert_eq!(bundle.split_public_inputs.coin_binding_tag, expected_tag);
+        assert!(
+            !proved_input
+                .proof
+                .0
+                .windows(32)
+                .any(|window| window == spend.commitment.0.0),
+            "v4 envelope must not expose coin commitment as a public bundle field"
+        );
         proved_input
             .well_formed(0)
-            .expect("ledger verifier accepts split input with both proofs");
+            .expect("ledger verifier accepts v4 wrapped split input");
 
-        let mut tampered_pk = proved_input.clone();
-        let mut tampered_pk_bundle = bundle.clone();
-        tampered_pk_bundle.split_public_inputs.public_key = coin::PublicKey(HashOutput([9u8; 32]));
-        tampered_pk.proof =
-            std::sync::Arc::new(ZswapInputProof::Split(tampered_pk_bundle).encode());
+        let mut tampered_wrapper_proof = proved_input.clone();
+        let mut tampered_wrapper_bundle = bundle.clone();
+        tampered_wrapper_bundle.wrapper_proof.0[0] ^= 1;
+        tampered_wrapper_proof.proof =
+            std::sync::Arc::new(ZswapInputProof::SplitWrapped(tampered_wrapper_bundle).encode());
         assert!(
-            tampered_pk.well_formed(0).is_err(),
-            "ledger verifier must reject a split bundle whose pk no longer matches the attestation/client proofs"
+            tampered_wrapper_proof.well_formed(0).is_err(),
+            "ledger verifier must reject a corrupted wrapper proof"
         );
 
-        let mut tampered_commitment_sk = proved_input.clone();
-        let mut tampered_commitment_sk_bundle = bundle.clone();
-        tampered_commitment_sk_bundle
-            .split_public_inputs
-            .commitment_sk = if bundle.split_public_inputs.commitment_sk
-            == transient_crypto::curve::Fr::from(1u64)
-        {
-            transient_crypto::curve::Fr::from(2u64)
-        } else {
-            transient_crypto::curve::Fr::from(1u64)
-        };
-        tampered_commitment_sk.proof =
-            std::sync::Arc::new(ZswapInputProof::Split(tampered_commitment_sk_bundle).encode());
-        assert!(
-            tampered_commitment_sk.well_formed(0).is_err(),
-            "ledger verifier must reject a split bundle whose C_sk no longer matches the attestation/client proofs"
+        let mut tampered_accumulator = proved_input.clone();
+        let mut tampered_accumulator_bundle = bundle.clone();
+        tampered_accumulator_bundle.aggregate_accumulator[0] ^= 1;
+        tampered_accumulator.proof = std::sync::Arc::new(
+            ZswapInputProof::SplitWrapped(tampered_accumulator_bundle).encode(),
         );
-
-        let mut tampered_attestation = proved_input.clone();
-        let mut tampered_attestation_bundle = bundle.clone();
         assert!(
-            !tampered_attestation_bundle.attestation_proof.0.is_empty(),
-            "synthetic v3 bundle should carry a non-empty attestation proof"
+            tampered_accumulator.well_formed(0).is_err(),
+            "ledger verifier must reject a corrupted aggregate accumulator"
         );
-        tampered_attestation_bundle.attestation_proof.0[0] ^= 1;
-        tampered_attestation.proof =
-            std::sync::Arc::new(ZswapInputProof::Split(tampered_attestation_bundle).encode());
-        assert!(
-            tampered_attestation.well_formed(0).is_err(),
-            "ledger verifier must reject a split bundle with a corrupted attestation proof"
-        );
-
-        let mut missing_client_proof = proved_input.clone();
-        missing_client_proof.proof = std::sync::Arc::new(bundle.spend_proof.clone());
-        assert!(missing_client_proof.well_formed(0).is_err());
 
         let mut tampered_nullifier = proved_input.clone();
         tampered_nullifier.nullifier = coin::Nullifier(HashOutput([7u8; 32]));
         assert!(tampered_nullifier.well_formed(0).is_err());
-
-        let mut tampered_binding = proved_input.clone();
-        let mut tampered_bundle = bundle.clone();
-        tampered_bundle.split_public_inputs.coin_binding_tag =
-            if expected_tag == transient_crypto::curve::Fr::from(1u64) {
-                transient_crypto::curve::Fr::from(2u64)
-            } else {
-                transient_crypto::curve::Fr::from(1u64)
-            };
-        tampered_binding.proof =
-            std::sync::Arc::new(ZswapInputProof::Split(tampered_bundle).encode());
-        assert!(tampered_binding.well_formed(0).is_err());
 
         let mut malformed_bundle = proved_input.clone();
         let mut malformed_bytes = malformed_bundle.proof.0.clone();

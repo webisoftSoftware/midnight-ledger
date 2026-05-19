@@ -53,17 +53,22 @@ use tracing::{debug, info};
 use transient_crypto::commitment::PedersenRandomness;
 use transient_crypto::curve::Fr;
 use transient_crypto::proofs::{
-    KeyLocation, PARAMS_VERIFIER, Proof, ProvingKeyMaterial, ProvingProvider,
+    KeyLocation, PARAMS_VERIFIER, ParamsProverProvider, Proof, ProvingKeyMaterial, ProvingProvider,
     Resolver as ResolverT, VerifierKey, WrappedIr,
 };
 use transient_crypto::repr::FieldRepr;
 
 use zkir as zkir_v2;
-use zswap::Input;
 use zswap::error::MalformedOffer;
 use zswap::ledger::State as ZswapLedgerState;
 use zswap::prove::ZswapResolver;
 use zswap::split_coin_binding_tag;
+use zswap::split_wrapper::{
+    SPLIT_WRAPPER_K, SplitWrapperProvingKey, SplitWrapperWitness, prove_split_wrapper,
+    read_split_wrapper_proving_key, split_wrapper_inner_keys,
+};
+use zswap::verify::{CLIENT_DERIVATION_VK, SPEND_SPLIT_VK, WALLET_ATTESTATION_VK};
+use zswap::{Input, ZswapInputProof};
 
 use crate::versioned_ir;
 use crate::worker_pool::{JobStatus, WorkError, WorkerPool};
@@ -77,6 +82,17 @@ lazy_static! {
         )
         .expect("data provider initialization failed")
     );
+    static ref SPLIT_WRAPPER_PROVING_KEY: Result<Arc<SplitWrapperProvingKey>, String> = {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../zswap/static/spend-split-wrapper.prover");
+        fs::read(&path)
+            .map_err(|e| format!("read split wrapper prover key {}: {e}", path.display()))
+            .and_then(|bytes| {
+                read_split_wrapper_proving_key(&bytes)
+                    .map(Arc::new)
+                    .map_err(|e| format!("deserialize split wrapper prover key: {e}"))
+            })
+    };
 }
 
 async fn payload_to_bytes(mut payload: Payload) -> Result<Bytes, Error> {
@@ -86,6 +102,13 @@ async fn payload_to_bytes(mut payload: Payload) -> Result<Bytes, Error> {
         body.extend_from_slice(&chunk);
     }
     Ok(body.freeze())
+}
+
+fn split_wrapper_proving_key() -> Result<Arc<SplitWrapperProvingKey>, WorkError> {
+    match &*SPLIT_WRAPPER_PROVING_KEY {
+        Ok(key) => Ok(key.clone()),
+        Err(message) => Err(WorkError::InternalError(message.clone())),
+    }
 }
 
 type TransactionProvePayload<S> = (
@@ -171,6 +194,7 @@ pub(crate) struct SplitSpendResponse {
     input_preimage_hex: String,
     proof_hex: Option<String>,
     proved_input_hex: Option<String>,
+    proof_version: Option<String>,
     proof_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     server_client_deriv_verify_ms: Option<u128>,
@@ -339,7 +363,10 @@ pub(crate) async fn prove_split_spend(
         .map_err(|e| ErrorBadRequest(format!("serialize split spend input preimage: {e}")))?;
 
     let mut server_split_prove_ms: Option<u128> = None;
-    let (proof_hex, proved_input_hex, proof_error) = if request.prove.unwrap_or(false) {
+    let (proof_hex, proved_input_hex, proof_version, proof_error) = if request
+        .prove
+        .unwrap_or(false)
+    {
         info!(
             stage = "split-prove",
             role = "server",
@@ -347,6 +374,7 @@ pub(crate) async fn prove_split_spend(
         );
         let prove_start = Instant::now();
         let ppi = input.proof.clone();
+        let split_input_for_worker = split_input.clone();
         let inline_data = request
             .proving_data
             .clone()
@@ -379,10 +407,48 @@ pub(crate) async fn prove_split_spend(
                         params: &resolver,
                         resolver: &resolver,
                     };
-                    let proof = provider
+                    let spend_proof = provider
                         .prove(&ppi, None)
                         .await
                         .map_err(|e| WorkError::BadInput(e.to_string()))?;
+                    let v3_proved_input = split_input_for_worker.into_proved_input(spend_proof);
+                    let split_bundle = match ZswapInputProof::decode(&v3_proved_input.proof)
+                        .map_err(|_| {
+                            WorkError::InternalError(
+                                "generated split proof did not decode as v3 bundle".to_string(),
+                            )
+                        })? {
+                        ZswapInputProof::Split(bundle) => bundle,
+                        ZswapInputProof::Plain(_) | ZswapInputProof::SplitWrapped(_) => {
+                            return Err(WorkError::InternalError(
+                                "generated split proof had unexpected envelope".to_string(),
+                            ));
+                        }
+                    };
+                    let witness =
+                        SplitWrapperWitness::from_split_bundle(&v3_proved_input, 0, &split_bundle)
+                            .map_err(|e| WorkError::InternalError(e.to_string()))?;
+                    let wrapper_params = resolver
+                        .get_params(SPLIT_WRAPPER_K)
+                        .await
+                        .map_err(|e| WorkError::InternalError(e.to_string()))?;
+                    let wrapper_proving_key = split_wrapper_proving_key()?;
+                    let inner_keys = split_wrapper_inner_keys(
+                        &WALLET_ATTESTATION_VK,
+                        &CLIENT_DERIVATION_VK,
+                        &SPEND_SPLIT_VK,
+                    )
+                    .map_err(|e| WorkError::InternalError(e.to_string()))?;
+                    let wrapper_bundle = prove_split_wrapper(
+                        &wrapper_params,
+                        &PARAMS_VERIFIER,
+                        &wrapper_proving_key,
+                        &inner_keys,
+                        &witness,
+                        OsRng,
+                    )
+                    .map_err(|e| WorkError::BadInput(e.to_string()))?;
+                    let proof = ZswapInputProof::SplitWrapped(wrapper_bundle).encode();
 
                     let mut response = Vec::new();
                     tagged_serialize(&ProofVersioned::V2(proof), &mut response)
@@ -403,7 +469,13 @@ pub(crate) async fn prove_split_spend(
                         ));
                     }
                 };
-                let proved_input = split_input.clone().into_proved_input(proof);
+                let proved_input = Input {
+                    nullifier: split_input.input.nullifier,
+                    value_commitment: split_input.input.value_commitment,
+                    contract_address: split_input.input.contract_address.clone(),
+                    merkle_tree_root: split_input.input.merkle_tree_root,
+                    proof: Arc::new(proof),
+                };
                 let proof = (*proved_input.proof).clone();
                 let mut proof_bytes = Vec::new();
                 tagged_serialize(&ProofVersioned::V2(proof), &mut proof_bytes)
@@ -415,10 +487,11 @@ pub(crate) async fn prove_split_spend(
                 (
                     Some(proof_bytes.encode_hex()),
                     Some(proved_input_bytes.encode_hex()),
+                    Some("split-wrapper-v4".to_string()),
                     None,
                 )
             }
-            Err(e) => (None, None, Some(work_error_message(e))),
+            Err(e) => (None, None, None, Some(work_error_message(e))),
         };
         let elapsed = prove_start.elapsed().as_millis();
         server_split_prove_ms = Some(elapsed);
@@ -430,7 +503,7 @@ pub(crate) async fn prove_split_spend(
         );
         outcome
     } else {
-        (None, None, None)
+        (None, None, None, None)
     };
     let status = match (&proof_hex, &proof_error, request.prove.unwrap_or(false)) {
         (Some(_), None, _) => SplitSpendStatus::ProofBuilt,
@@ -450,6 +523,7 @@ pub(crate) async fn prove_split_spend(
         input_preimage_hex: input_preimage_bytes.encode_hex(),
         proof_hex,
         proved_input_hex,
+        proof_version,
         proof_error,
         server_client_deriv_verify_ms,
         server_split_prove_ms,

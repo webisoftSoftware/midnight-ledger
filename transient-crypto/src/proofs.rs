@@ -19,10 +19,10 @@ use crate::curve::{Fr, outer};
 use base_crypto::hash::{HashOutput, persistent_hash};
 use lazy_static::lazy_static;
 use lru::LruCache;
-use midnight_curves::Bls12;
+use midnight_curves::{Bls12, pairing::Engine};
 use midnight_proofs::{
     poly::kzg::params::{ParamsKZG, ParamsVerifierKZG},
-    utils::SerdeFormat,
+    utils::{SerdeFormat, helpers::ProcessedSerdeObject, helpers::byte_length},
 };
 use midnight_zk_stdlib::{MidnightCircuit, MidnightPK, MidnightVK, Relation};
 #[cfg(feature = "proptest")]
@@ -60,8 +60,12 @@ pub trait ParamsProverProvider {
     async fn get_params(&self, k: u8) -> io::Result<ParamsProver>;
 }
 
-/// The hash used during proof transcript processing
-pub type TranscriptHash = blake2b_simd::State;
+/// The hash used during proof transcript processing.
+///
+/// This branch intentionally uses the Poseidon transcript expected by
+/// `midnight-circuits::verifier::VerifierGadget`, so split proofs can be
+/// recursively verified by the v4 privacy wrapper.
+pub type TranscriptHash = midnight_circuits::hash::poseidon::PoseidonState<outer::Scalar>;
 
 impl ParamsProverProvider for base_crypto::data_provider::MidnightDataProvider {
     async fn get_params(&self, k: u8) -> io::Result<ParamsProver> {
@@ -95,7 +99,8 @@ impl ParamsProver {
         )?)))
     }
 
-    pub(crate) fn as_verifier(&self) -> ParamsVerifier {
+    /// Returns the verifier parameters corresponding to these prover parameters.
+    pub fn as_verifier(&self) -> ParamsVerifier {
         ParamsVerifier(Arc::new(self.0.verifier_params()))
     }
 }
@@ -115,6 +120,101 @@ impl ParamsVerifier {
     pub fn read<R: Read>(reader: R) -> io::Result<Self> {
         Ok(ParamsProver::read(reader)?.as_verifier())
     }
+
+    /// Reads a verifier-only parameter stream.
+    pub fn read_verifier<R: Read>(mut reader: R) -> io::Result<Self> {
+        Ok(ParamsVerifier(Arc::new(ParamsVerifierKZG::read(
+            &mut reader,
+            SerdeFormat::RawBytesUnchecked,
+        )?)))
+    }
+
+    /// Reads verifier parameters from a cached Midnight prover-parameter file.
+    ///
+    /// This avoids embedding large parameter blobs into verifier binaries. The
+    /// cache location follows the same `$MIDNIGHT_PP`, `$XDG_CACHE_HOME`, then
+    /// `$HOME/.cache/midnight/zk-params` order as [`MidnightDataProvider`].
+    pub fn read_cached_prover(k: u8) -> io::Result<Self> {
+        let dir = std::env::var_os("MIDNIGHT_PP")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("XDG_CACHE_HOME").map(|p| {
+                    std::path::PathBuf::from(p)
+                        .join("midnight")
+                        .join("zk-params")
+                })
+            })
+            .or_else(|| {
+                std::env::var_os("HOME").map(|p| {
+                    std::path::PathBuf::from(p)
+                        .join(".cache")
+                        .join("midnight")
+                        .join("zk-params")
+                })
+            })
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "Could not determine $HOME, $XDG_CACHE_HOME, or $MIDNIGHT_PP",
+                )
+            })?;
+        Self::read(std::fs::File::open(dir.join(
+            base_crypto::data_provider::MidnightDataProvider::name_k(k),
+        ))?)
+    }
+
+    /// Borrows the underlying KZG verifier parameters.
+    pub fn as_kzg(&self) -> &ParamsVerifierKZG<Bls12> {
+        &self.0
+    }
+
+    /// Reads only the verifier portion from a prover-parameter stream.
+    ///
+    /// Midnight parameter files store all G1 powers first, then `[1]₂`, then
+    /// `[tau]₂`. Verifiers only need `[tau]₂`, so this skips the prover-only
+    /// G1 material instead of retaining a full KZG parameter blob in memory.
+    pub fn read_verifier_only_from_prover<R: Read>(mut reader: R) -> io::Result<Self> {
+        let mut k = [0u8; 4];
+        reader.read_exact(&mut k)?;
+        let n = 1usize << u32::from_le_bytes(k);
+        skip_exact(
+            &mut reader,
+            2 * n * byte_length::<<Bls12 as Engine>::G1>(SerdeFormat::RawBytesUnchecked)
+                + byte_length::<<Bls12 as Engine>::G2>(SerdeFormat::RawBytesUnchecked),
+        )?;
+        Ok(ParamsVerifier(Arc::new(ParamsVerifierKZG::read(
+            &mut reader,
+            SerdeFormat::RawBytesUnchecked,
+        )?)))
+    }
+
+    /// Returns the verifier SRS element `[tau]₂` for recursive accumulator
+    /// checks.
+    pub fn tau_in_g2(&self) -> io::Result<<Bls12 as Engine>::G2Affine> {
+        let mut bytes = Vec::new();
+        self.0.write(&mut bytes, SerdeFormat::RawBytesUnchecked)?;
+        let tau = <<Bls12 as Engine>::G2 as ProcessedSerdeObject>::read(
+            &mut &bytes[..],
+            SerdeFormat::RawBytesUnchecked,
+        )?;
+        Ok(tau.into())
+    }
+
+    /// Writes only the verifier SRS element `[tau]₂`.
+    pub fn write<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        self.0.write(writer, SerdeFormat::RawBytesUnchecked)
+    }
+}
+
+fn skip_exact(reader: &mut impl Read, bytes: usize) -> io::Result<()> {
+    let copied = io::copy(&mut reader.take(bytes as u64), &mut io::sink())?;
+    if copied != bytes as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "parameter stream ended before verifier parameters",
+        ));
+    }
+    Ok(())
 }
 
 const PARAMS_VERIFIER_RAW: &[u8] = include_bytes!("../static/bls_midnight_2p14");
@@ -555,6 +655,11 @@ impl VerifierKey {
             &params.0, &vk, &pi, None, &proof.0,
         )
         .map_err(|_| anyhow::anyhow!("Invalid proof"))
+    }
+
+    /// Returns the initialized Midnight verifier key.
+    pub fn midnight_vk(&self) -> Result<MidnightVK, VerifyingError> {
+        self.force_init()
     }
 
     /// Mocks the checking of a proof against a statement

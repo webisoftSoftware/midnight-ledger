@@ -41,6 +41,7 @@ pub mod keys;
 pub mod ledger;
 pub mod local;
 pub mod prove;
+pub mod split_wrapper;
 mod structure;
 pub mod verify;
 

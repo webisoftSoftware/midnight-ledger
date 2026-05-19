@@ -13,6 +13,7 @@
 
 use crate::ZSWAP_TREE_HEIGHT;
 use crate::error::MalformedOffer;
+use crate::split_wrapper::SplitWrapperProofBundle;
 use base_crypto::hash::HashOutput;
 use coin_structure::coin::{
     Commitment, Info as CoinInfo, Nullifier, PublicKey as CoinPublicKey, ShieldedTokenType,
@@ -275,6 +276,7 @@ pub struct SplitProofBundle {
 pub enum ZswapInputProof {
     Plain(Proof),
     Split(SplitProofBundle),
+    SplitWrapped(SplitWrapperProofBundle),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -304,10 +306,16 @@ impl ZswapInputProof {
         match self {
             ZswapInputProof::Plain(proof) => proof,
             ZswapInputProof::Split(bundle) => bundle.encode(),
+            ZswapInputProof::SplitWrapped(bundle) => bundle.encode(),
         }
     }
 
     pub fn decode(proof: &Proof) -> Result<Self, MalformedSplitProofBundle> {
+        if SplitWrapperProofBundle::is_v4(proof) {
+            return SplitWrapperProofBundle::decode(proof)
+                .map(ZswapInputProof::SplitWrapped)
+                .map_err(|_| MalformedSplitProofBundle);
+        }
         if !proof.0.starts_with(SPLIT_PROOF_BUNDLE_MAGIC) {
             return Ok(ZswapInputProof::Plain(proof.clone()));
         }
