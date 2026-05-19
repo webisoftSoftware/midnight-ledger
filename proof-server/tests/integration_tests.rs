@@ -694,7 +694,7 @@ mod split_spend_endpoint {
         let request_timeout_secs = env::var("MIDNIGHT_PREVIEW_REQUEST_TIMEOUT_SECS")
             .ok()
             .and_then(|value| value.parse().ok())
-            .unwrap_or(180);
+            .unwrap_or(600);
         let result = prove_preview_wallet_split_spend(PreviewSplitProveOptions {
             proof_server_url: &base_url,
             event_limit: None,

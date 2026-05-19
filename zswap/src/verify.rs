@@ -76,6 +76,9 @@ const SIGN_VK_RAW: &[u8] = include_bytes!("../static/sign.verifier");
 const SIGN_SPLIT_VK_RAW: &[u8] = include_bytes!("../static/sign-split.verifier");
 #[cfg(feature = "proof-verifying")]
 const SPEND_SPLIT_WRAPPER_VK_RAW: &[u8] = include_bytes!("../static/spend-split-wrapper.verifier");
+#[cfg(feature = "proof-verifying")]
+const SPLIT_WRAPPER_PARAMS_VERIFIER_RAW: &[u8] =
+    include_bytes!("../../transient-crypto/static/bls_midnight_2p20.verifier");
 
 #[cfg(feature = "proof-verifying")]
 lazy_static! {
@@ -103,7 +106,7 @@ lazy_static! {
         read_split_wrapper_verifying_key(SPEND_SPLIT_WRAPPER_VK_RAW)
             .expect("Zswap Split Wrapper VK should be valid");
     pub static ref SPLIT_WRAPPER_PARAMS_VERIFIER: ParamsVerifier =
-        ParamsVerifier::read_cached_prover(SPLIT_WRAPPER_K)
+        ParamsVerifier::read_verifier(SPLIT_WRAPPER_PARAMS_VERIFIER_RAW)
             .expect("Zswap Split Wrapper verifier params should be valid");
     pub static ref SPLIT_WRAPPER_INNER_KEYS: SplitWrapperInnerKeys = split_wrapper_inner_keys(
         &WALLET_ATTESTATION_VK,
