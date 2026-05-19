@@ -84,6 +84,8 @@ use midnight_proofs::{
     transcript::{CircuitTranscript, Transcript},
     utils::SerdeFormat,
 };
+#[cfg(feature = "proof-verifying")]
+use rand::rngs::OsRng;
 
 pub const SPLIT_WRAPPER_K: u8 = 20;
 
@@ -597,7 +599,7 @@ impl Circuit<F> for SplitWrapperCircuit {
         let core_decomp_chip =
             P2RDecompositionChip::new(&config.1, &(SPLIT_WRAPPER_K as usize - 1));
         let scalar_chip = NativeGadget::new(core_decomp_chip.clone(), native_chip.clone());
-        let curve_chip = ForeignEccChip::new(&config.2, &scalar_chip, &scalar_chip);
+        let curve_chip = ForeignEccChip::new(&config.2, &scalar_chip, &scalar_chip, OsRng);
         let poseidon_chip = PoseidonChip::new(&config.3, &native_chip);
         let verifier_chip = VerifierGadget::new(&curve_chip, &scalar_chip, &poseidon_chip);
 
