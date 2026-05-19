@@ -60,12 +60,11 @@ pub trait ParamsProverProvider {
     async fn get_params(&self, k: u8) -> io::Result<ParamsProver>;
 }
 
-/// The hash used during proof transcript processing.
-///
-/// This branch intentionally uses the Poseidon transcript expected by
-/// `midnight-circuits::verifier::VerifierGadget`, so split proofs can be
-/// recursively verified by the v4 privacy wrapper.
-pub type TranscriptHash = midnight_circuits::hash::poseidon::PoseidonState<outer::Scalar>;
+/// The hash used during normal proof transcript processing.
+pub type TranscriptHash = blake2b_simd::State;
+
+/// The transcript used by recursive verifier gadgets.
+pub type PoseidonTranscriptHash = midnight_circuits::hash::poseidon::PoseidonState<outer::Scalar>;
 
 impl ParamsProverProvider for base_crypto::data_provider::MidnightDataProvider {
     async fn get_params(&self, k: u8) -> io::Result<ParamsProver> {
@@ -652,6 +651,23 @@ impl VerifierKey {
         let pi = statement.map(|f| f.0).collect::<Vec<_>>();
         trace!(statement = ?pi, "verifying proof against statement");
         midnight_zk_stdlib::verify::<DummyRelation, TranscriptHash>(
+            &params.0, &vk, &pi, None, &proof.0,
+        )
+        .map_err(|_| anyhow::anyhow!("Invalid proof"))
+    }
+
+    /// Checks a proof against a statement using the Poseidon transcript
+    /// required by recursive verifier gadgets.
+    pub fn verify_poseidon<F: Iterator<Item = Fr>>(
+        &self,
+        params: &ParamsVerifier,
+        proof: &Proof,
+        statement: F,
+    ) -> Result<(), VerifyingError> {
+        let vk = self.force_init()?;
+        let pi = statement.map(|f| f.0).collect::<Vec<_>>();
+        trace!(statement = ?pi, "verifying Poseidon-transcript proof against statement");
+        midnight_zk_stdlib::verify::<DummyRelation, PoseidonTranscriptHash>(
             &params.0, &vk, &pi, None, &proof.0,
         )
         .map_err(|_| anyhow::anyhow!("Invalid proof"))

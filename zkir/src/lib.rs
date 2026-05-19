@@ -19,7 +19,8 @@ use rand::{CryptoRng, Rng};
 use serialize::tagged_deserialize;
 use transient_crypto::curve::Fr;
 use transient_crypto::proofs::{
-    ParamsProverProvider, Proof, ProofPreimage, ProvingProvider, Resolver,
+    ParamsProverProvider, Proof, ProofPreimage, ProverKey, ProvingError, ProvingProvider, Resolver,
+    VerifierKey,
 };
 
 mod ir;
@@ -27,6 +28,39 @@ mod ir_vm;
 
 pub use ir::{Instruction, IrSource};
 pub use ir_vm::Preprocessed;
+
+/// Proves a ZKIR preimage with the Poseidon transcript used by recursive
+/// verifier gadgets.
+pub async fn prove_poseidon(
+    preimage: &ProofPreimage,
+    rng: impl Rng + CryptoRng,
+    params: &impl ParamsProverProvider,
+    resolver: &impl Resolver,
+) -> Result<(Proof, Vec<Option<usize>>), ProvingError> {
+    let proof_data = resolver
+        .resolve_key(preimage.key_location.clone())
+        .await?
+        .ok_or(anyhow::Error::msg(format!(
+            "failed to find proving key for '{}'",
+            &preimage.key_location.0
+        )))?;
+    let ir = tagged_deserialize::<IrSource>(&mut &proof_data.ir_source[..])?;
+    let verifier_key = tagged_deserialize::<VerifierKey>(&mut &proof_data.verifier_key[..])?;
+    let prover_key = tagged_deserialize::<ProverKey<IrSource>>(&mut &proof_data.prover_key[..])?;
+    let (proof, pis, pi_skips) = ir.prove_poseidon(rng, params, prover_key, preimage).await?;
+    debug!("Poseidon proof created; verifying to make sure");
+    let k = verifier_key.midnight_vk()?.k();
+    if let Err(e) = verifier_key.verify_poseidon(
+        &params.get_params(k).await?.as_verifier(),
+        &proof,
+        pis.iter().copied(),
+    ) {
+        error!(error = ?e, ?pis, ?ir, "Poseidon self-verification failed! This may be a bug, check that your keys match!");
+        return Err(e);
+    }
+    debug!("Poseidon proof ok");
+    Ok((proof, pi_skips))
+}
 
 /// Implements `ProvingProvider` locally
 pub struct LocalProvingProvider<

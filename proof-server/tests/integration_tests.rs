@@ -577,7 +577,10 @@ mod split_spend_endpoint {
         let status = response.status();
         let body: serde_json::Value = response.json().await.expect("split response JSON");
         assert_eq!(status, 200, "unexpected split response: {body}");
-        assert_eq!(body["status"], "proofBuilt", "unexpected split response: {body}");
+        assert_eq!(
+            body["status"], "proofBuilt",
+            "unexpected split response: {body}"
+        );
         assert_eq!(body["proofVersion"], "split-wrapper-v4");
         assert_eq!(body["merklePathSource"], "zswapState");
         assert!(body["proofError"].is_null());

@@ -966,8 +966,7 @@ async fn prove_client_derivation(
         )
         .map_err(|e| format!("data provider initialization failed: {e}"))?,
     ));
-    let (proof, _) = preimage
-        .prove::<zkir::IrSource>(OsRng, &resolver, &resolver)
+    let (proof, _) = zkir::prove_poseidon(&preimage, OsRng, &resolver, &resolver)
         .await
         .map_err(|e| format!("client derivation proof failed: {e}"))?;
     Ok(proof)
@@ -1116,8 +1115,7 @@ pub(crate) async fn prove_wallet_attestation(
         )
         .map_err(|e| format!("data provider initialization failed: {e}"))?,
     ));
-    let (proof, _) = preimage
-        .prove::<zkir::IrSource>(OsRng, &resolver, &resolver)
+    let (proof, _) = zkir::prove_poseidon(&preimage, OsRng, &resolver, &resolver)
         .await
         .map_err(|e| format!("wallet attestation proof failed: {e}"))?;
     Ok(PreviewWalletAttestation {

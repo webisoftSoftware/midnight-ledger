@@ -67,7 +67,7 @@ use transient_crypto::curve::Fr;
 #[cfg(feature = "proof-verifying")]
 use transient_crypto::merkle_tree::MerkleTreeDigest;
 #[cfg(feature = "proof-verifying")]
-use transient_crypto::proofs::{ParamsProver, ParamsVerifier, TranscriptHash};
+use transient_crypto::proofs::{ParamsProver, ParamsVerifier, PoseidonTranscriptHash};
 use transient_crypto::proofs::{Proof, VerifierKey};
 use transient_crypto::repr::FieldRepr;
 
@@ -959,8 +959,8 @@ pub fn prove_split_wrapper(
     let public_inputs =
         wrapper_verification_statement(inner_keys, &witness.public_inputs, &aggregate_acc);
     let circuit = SplitWrapperCircuit::with_witness(inner_keys.clone(), witness);
-    let mut transcript = CircuitTranscript::<TranscriptHash>::init();
-    create_proof::<F, KZGCommitmentScheme<E>, CircuitTranscript<TranscriptHash>, _>(
+    let mut transcript = CircuitTranscript::<PoseidonTranscriptHash>::init();
+    create_proof::<F, KZGCommitmentScheme<E>, CircuitTranscript<PoseidonTranscriptHash>, _>(
         params.as_ref(),
         proving_key,
         &[circuit],
@@ -1026,8 +1026,9 @@ fn verify_split_wrapper_proof(
 ) -> Result<(), PlonkError> {
     let public_inputs =
         wrapper_verification_statement(inner_keys, input_public_inputs, aggregate_acc);
-    let mut transcript = CircuitTranscript::<TranscriptHash>::init_from_bytes(&wrapper_proof.0);
-    let guard = prepare::<F, KZGCommitmentScheme<E>, CircuitTranscript<TranscriptHash>>(
+    let mut transcript =
+        CircuitTranscript::<PoseidonTranscriptHash>::init_from_bytes(&wrapper_proof.0);
+    let guard = prepare::<F, KZGCommitmentScheme<E>, CircuitTranscript<PoseidonTranscriptHash>>(
         verifying_key,
         &[&[C::identity()]],
         &[&[&public_inputs]],

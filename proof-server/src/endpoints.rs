@@ -53,7 +53,7 @@ use tracing::{debug, info};
 use transient_crypto::commitment::PedersenRandomness;
 use transient_crypto::curve::Fr;
 use transient_crypto::proofs::{
-    KeyLocation, PARAMS_VERIFIER, ParamsProverProvider, Proof, ProvingKeyMaterial, ProvingProvider,
+    KeyLocation, PARAMS_VERIFIER, ParamsProverProvider, Proof, ProvingKeyMaterial,
     Resolver as ResolverT, VerifierKey, WrappedIr,
 };
 use transient_crypto::repr::FieldRepr;
@@ -402,15 +402,10 @@ pub(crate) async fn prove_split_spend(
                             Box::pin(std::future::ready(Ok(inline_data_resolver.clone())))
                         }),
                     );
-                    let provider = zkir_v2::LocalProvingProvider {
-                        rng: OsRng,
-                        params: &resolver,
-                        resolver: &resolver,
-                    };
-                    let spend_proof = provider
-                        .prove(&ppi, None)
-                        .await
-                        .map_err(|e| WorkError::BadInput(e.to_string()))?;
+                    let (spend_proof, _) =
+                        zkir_v2::prove_poseidon(&ppi, OsRng, &resolver, &resolver)
+                            .await
+                            .map_err(|e| WorkError::BadInput(e.to_string()))?;
                     let v3_proved_input = split_input_for_worker.into_proved_input(spend_proof);
                     let split_bundle = match ZswapInputProof::decode(&v3_proved_input.proof)
                         .map_err(|_| {
@@ -599,7 +594,7 @@ async fn verify_client_derivation_proof(
         commitment_sk,
     ));
     verifier_key
-        .verify(&PARAMS_VERIFIER, &proof, statement.into_iter())
+        .verify_poseidon(&PARAMS_VERIFIER, &proof, statement.into_iter())
         .map_err(|e| ErrorBadRequest(format!("invalid client derivation proof: {e}")))
 }
 
@@ -627,7 +622,7 @@ async fn verify_attestation_proof(
         commitment_sk,
     ));
     verifier_key
-        .verify(&PARAMS_VERIFIER, &proof, statement.into_iter())
+        .verify_poseidon(&PARAMS_VERIFIER, &proof, statement.into_iter())
         .map_err(|e| ErrorBadRequest(format!("invalid wallet attestation proof: {e}")))
 }
 

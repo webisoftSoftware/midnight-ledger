@@ -27,7 +27,8 @@ use std::io::{self, Read};
 use std::sync::Arc;
 use transient_crypto::curve::Fr;
 use transient_crypto::proofs::{
-    ParamsProverProvider, Proof, ProofPreimage, ProverKey, ProvingError, TranscriptHash, Zkir,
+    ParamsProverProvider, PoseidonTranscriptHash, Proof, ProofPreimage, ProverKey, ProvingError,
+    TranscriptHash, Zkir,
 };
 
 /// A low-level IR allowing the prover to populate circuit witnesses.
@@ -78,6 +79,32 @@ impl Zkir for IrSource {
 }
 
 impl IrSource {
+    /// Proves with the Poseidon Fiat-Shamir transcript expected by recursive
+    /// verifier gadgets.
+    pub async fn prove_poseidon(
+        &self,
+        rng: impl Rng + CryptoRng,
+        params: &impl ParamsProverProvider,
+        pk: ProverKey<Self>,
+        preimage: &ProofPreimage,
+    ) -> Result<(Proof, Vec<Fr>, Vec<Option<usize>>), ProvingError> {
+        use midnight_zk_stdlib::prove;
+
+        let params_k = params.get_params(pk.init()?.k()).await?;
+        let preproc = self.preprocess(preimage)?;
+        let pis = preproc.pis.clone();
+        let pi_skips = preproc.pi_skips.clone();
+
+        let pk = pk
+            .init()
+            .map_err(|_| anyhow::anyhow!("Could not init pk"))?;
+
+        let proof =
+            prove::<_, PoseidonTranscriptHash>(params_k.as_ref(), &pk, self, &pis, preproc, rng)?;
+
+        Ok((Proof(proof), pis.into_iter().map(Fr).collect(), pi_skips))
+    }
+
     /// Split-prove variant: marks the first `committed_input_count` witness
     /// elements as committed instances, hiding them from the verifier.
     pub async fn prove_split(
@@ -100,7 +127,8 @@ impl IrSource {
             .init()
             .map_err(|_| anyhow::anyhow!("Could not init pk"))?;
 
-        let proof = prove::<_, TranscriptHash>(params_k.as_ref(), &pk, self, &pis, preproc, rng)?;
+        let proof =
+            prove::<_, PoseidonTranscriptHash>(params_k.as_ref(), &pk, self, &pis, preproc, rng)?;
 
         Ok((Proof(proof), pis.into_iter().map(Fr).collect(), pi_skips))
     }
