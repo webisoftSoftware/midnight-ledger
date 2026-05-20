@@ -198,8 +198,13 @@ pub(crate) struct SplitSpendResponse {
     proof_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     server_client_deriv_verify_ms: Option<u128>,
+    /// Backwards-compatible name for the full remote proving stage. In the
+    /// recursive-wrapper flow this includes both `spend-split` and wrapper
+    /// proving, so new callers should prefer `server_recursive_prove_ms`.
     #[serde(skip_serializing_if = "Option::is_none")]
     server_split_prove_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    server_recursive_prove_ms: Option<u128>,
     server_total_ms: u128,
 }
 
@@ -522,6 +527,7 @@ pub(crate) async fn prove_split_spend(
         proof_error,
         server_client_deriv_verify_ms,
         server_split_prove_ms,
+        server_recursive_prove_ms: server_split_prove_ms,
         server_total_ms: server_t0.elapsed().as_millis(),
     }))
 }

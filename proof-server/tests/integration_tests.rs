@@ -585,6 +585,14 @@ mod split_spend_endpoint {
         assert_eq!(body["merklePathSource"], "zswapState");
         assert!(body["proofError"].is_null());
         assert!(
+            body["serverRecursiveProveMs"].as_u64().is_some(),
+            "response should report recursive server proving time: {body}"
+        );
+        assert_eq!(
+            body["serverRecursiveProveMs"], body["serverSplitProveMs"],
+            "legacy and recursive proving timing fields should stay aligned"
+        );
+        assert!(
             body["proofHex"]
                 .as_str()
                 .expect("proofHex should be present")
@@ -707,7 +715,7 @@ mod split_spend_endpoint {
         let report = result.expect("preview split prove must succeed");
         print_staged_report(&report);
         eprintln!(
-            "split-sent preview output key_index={key_index} mt_index={mt_index} input_value={} transfer_value={} change_value={} token={} recipient={} status={} client_proof_ms={} server_proof_ms={} split_proof_total_ms={} server_client_ratio={} proof_len={} tx_hash={} tx_id={} tx_len={} pre_submit_wasm_check={} inclusion={} block_hash={}",
+            "split-sent preview output key_index={key_index} mt_index={mt_index} input_value={} transfer_value={} change_value={} token={} recipient={} status={} client_proof_ms={} server_recursive_proof_ms={} split_proof_total_ms={} server_client_ratio={} proof_len={} tx_hash={} tx_id={} tx_len={} pre_submit_wasm_check={} inclusion={} block_hash={}",
             report.coin_value,
             report.transfer_value,
             report.change_value,

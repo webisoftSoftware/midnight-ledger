@@ -20,6 +20,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant};
 use storage::arena::Sp;
 use storage::db::InMemoryDB;
@@ -47,6 +49,7 @@ const WALLET_ATTESTATION_KEY_LOCATION: &str = "split/wallet/attestation";
 /// `circuits/wallet_attestation.compact` and `circuits/sk_proof.compact`.
 const SK_COMMIT_SEPARATOR: &str = "midnight:sk-commit[v1]";
 const DEFAULT_PREVIEW_TRANSFER_AMOUNT: u128 = 500 * 1_000_000;
+const DEFAULT_LIVE_TIMER_INTERVAL_MS: u64 = 5_000;
 
 pub fn split_nullifier(coin: &CoinInfo, sk: &coin_structure::coin::SecretKey) -> Nullifier {
     coin.nullifier(&SenderEvidence::User(Cow::Borrowed(sk)))
@@ -89,6 +92,114 @@ impl PreviewSplitProveTimings {
     pub fn wall_clock(&self) -> Duration {
         self.scan + self.derive_total + self.handoff_total + self.assemble_and_submit
     }
+}
+
+#[derive(Clone, Copy)]
+struct LiveTimerConfig {
+    enabled: bool,
+    interval: Duration,
+}
+
+struct LivePhaseTimer {
+    enabled: bool,
+    label: String,
+    started: Instant,
+    stop: Option<mpsc::Sender<()>>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl LivePhaseTimer {
+    fn start(config: LiveTimerConfig, label: impl Into<String>) -> Self {
+        let label = label.into();
+        let started = Instant::now();
+        if !config.enabled {
+            return Self {
+                enabled: false,
+                label,
+                started,
+                stop: None,
+                handle: None,
+            };
+        }
+
+        let (tx, rx) = mpsc::channel();
+        let thread_label = label.clone();
+        let interval = config.interval;
+        eprintln!("timer {label}: started");
+        let handle = thread::spawn(move || {
+            loop {
+                match rx.recv_timeout(interval) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        eprintln!(
+                            "timer {thread_label}: {} elapsed",
+                            format_timer_duration(started.elapsed())
+                        );
+                    }
+                }
+            }
+        });
+
+        Self {
+            enabled: true,
+            label,
+            started,
+            stop: Some(tx),
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for LivePhaseTimer {
+    fn drop(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+        eprintln!(
+            "timer {}: done in {}",
+            self.label,
+            format_timer_duration(self.started.elapsed())
+        );
+    }
+}
+
+fn preview_live_timer_config(env: &HashMap<String, String>) -> LiveTimerConfig {
+    let enabled = !matches!(
+        env_value_or(env, "MIDNIGHT_PREVIEW_LIVE_TIMERS", "1")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "0" | "false" | "no" | "off"
+    );
+    let interval_ms = env_value_or(
+        env,
+        "MIDNIGHT_PREVIEW_LIVE_TIMER_INTERVAL_MS",
+        &DEFAULT_LIVE_TIMER_INTERVAL_MS.to_string(),
+    )
+    .parse::<u64>()
+    .unwrap_or(DEFAULT_LIVE_TIMER_INTERVAL_MS)
+    .max(250);
+
+    LiveTimerConfig {
+        enabled,
+        interval: Duration::from_millis(interval_ms),
+    }
+}
+
+fn format_timer_duration(duration: Duration) -> String {
+    let total_ms = duration.as_millis();
+    if total_ms < 1_000 {
+        return format!("{total_ms} ms");
+    }
+    let seconds = total_ms / 1_000;
+    let millis = total_ms % 1_000;
+    format!("{seconds}.{millis:03} s")
 }
 
 #[derive(Debug)]
@@ -153,15 +264,16 @@ pub fn print_staged_report(report: &PreviewSplitProveReport) {
         ms(t.derive_local_proving)
     );
     println!(
-        "  server proof:  spend-split proof (remote)           {:>6}",
+        "  server proof:  recursive proving, remote            {:>6}",
         opt_ms(t.server_split_prove)
     );
+    println!("                 includes spend-split + recursive privacy wrapper");
     println!(
         "  split-prove proving total                           {:>6}",
         proof_total
     );
     println!(
-        "  ratio (server proof / client proof)                 {:>6}",
+        "  ratio (server recursive proof / client proof)       {:>6}",
         ratio
     );
     println!();
@@ -198,9 +310,10 @@ pub fn print_staged_report(report: &PreviewSplitProveReport) {
         opt_ms(t.server_client_deriv_verify)
     );
     println!(
-        "         └─ server: split-spend proving                   {:>6}",
+        "         └─ server: recursive proving                      {:>6}",
         opt_ms(t.server_split_prove)
     );
+    println!("            └─ includes spend-split proof + privacy wrapper proof");
     println!();
     println!("--- NODE + INDEXER ---");
     println!("  [6/6] submit     author_submitAndWatchExtrinsic          (bundled in [5/6])");
@@ -239,6 +352,7 @@ pub async fn prove_preview_wallet_split_spend(
     options: PreviewSplitProveOptions<'_>,
 ) -> PreviewResult<PreviewSplitProveReport> {
     let env = preview_env();
+    let live_timer = preview_live_timer_config(&env);
     let secret_keys = preview_zswap_secret_keys_scan(&env)?;
     let event_limit = options.event_limit.unwrap_or_else(|| {
         env_value(&env, "MIDNIGHT_PREVIEW_ZSWAP_EVENT_LIMIT")
@@ -249,7 +363,10 @@ pub async fn prove_preview_wallet_split_spend(
 
     tracing::info!(stage = "scan", role = "client", "▶ CLIENT/scan");
     let scan_start = Instant::now();
-    let wallet_spend = select_preview_wallet_spend(&secret_keys, &env, event_limit)?;
+    let wallet_spend = {
+        let _timer = LivePhaseTimer::start(live_timer, "CLIENT scan/select funded shielded coin");
+        select_preview_wallet_spend(&secret_keys, &env, event_limit)?
+    };
     timings.scan = scan_start.elapsed();
     tracing::info!(
         stage = "scan",
@@ -262,7 +379,11 @@ pub async fn prove_preview_wallet_split_spend(
 
     tracing::info!(stage = "derive", role = "client", "▶ CLIENT/derive");
     let derive_start = Instant::now();
-    let (handoff, proving_elapsed) = build_split_spend_handoff_timed(&wallet_spend).await?;
+    let (handoff, proving_elapsed) = {
+        let _timer =
+            LivePhaseTimer::start(live_timer, "CLIENT derive handoff + clientDerivationProof");
+        build_split_spend_handoff_timed(&wallet_spend).await?
+    };
     timings.derive_total = derive_start.elapsed();
     timings.derive_local_proving = proving_elapsed;
     tracing::info!(
@@ -279,12 +400,18 @@ pub async fn prove_preview_wallet_split_spend(
         "▶ HANDOFF POST /v2/prove-split-spend"
     );
     let handoff_start = Instant::now();
-    let body = post_split_spend_handoff(
-        options.proof_server_url,
-        handoff,
-        options.request_timeout_secs,
-    )
-    .await?;
+    let body = {
+        let _timer = LivePhaseTimer::start(
+            live_timer,
+            "SERVER recursive proving (spend-split + privacy wrapper)",
+        );
+        post_split_spend_handoff(
+            options.proof_server_url,
+            handoff,
+            options.request_timeout_secs,
+        )
+        .await?
+    };
     timings.handoff_total = handoff_start.elapsed();
     tracing::info!(
         stage = "handoff",
@@ -296,8 +423,9 @@ pub async fn prove_preview_wallet_split_spend(
     timings.server_client_deriv_verify = body["serverClientDerivVerifyMs"]
         .as_u64()
         .map(Duration::from_millis);
-    timings.server_split_prove = body["serverSplitProveMs"]
+    timings.server_split_prove = body["serverRecursiveProveMs"]
         .as_u64()
+        .or_else(|| body["serverSplitProveMs"].as_u64())
         .map(Duration::from_millis);
     timings.server_total = body["serverTotalMs"].as_u64().map(Duration::from_millis);
 
@@ -309,15 +437,19 @@ pub async fn prove_preview_wallet_split_spend(
         "▶ CLIENT/assemble + NODE/submit"
     );
     let submit_start = Instant::now();
-    let submission = submit_split_send_transaction(
-        &env,
-        options.proof_server_url,
-        &wallet_spend,
-        &body,
-        &recipient,
-        transfer_value,
-    )
-    .await?;
+    let submission = {
+        let _timer =
+            LivePhaseTimer::start(live_timer, "CLIENT/NODE assemble, Dust-balance, submit");
+        submit_split_send_transaction(
+            &env,
+            options.proof_server_url,
+            &wallet_spend,
+            &body,
+            &recipient,
+            transfer_value,
+        )
+        .await?
+    };
     timings.assemble_and_submit = submit_start.elapsed();
     tracing::info!(
         stage = "assemble-submit",
@@ -335,7 +467,10 @@ pub async fn prove_preview_wallet_split_spend(
         "▶ NODE/independent on-chain verification"
     );
     let verify_start = Instant::now();
-    let verification = verify_onchain_inclusion(&env, &submission)?;
+    let verification = {
+        let _timer = LivePhaseTimer::start(live_timer, "NODE independent on-chain verification");
+        verify_onchain_inclusion(&env, &submission)?
+    };
     tracing::info!(
         stage = "onchain-verify",
         role = "node",
