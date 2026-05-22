@@ -271,9 +271,8 @@ impl<D: DB> Input<ProofPreimage, D> {
         commitment_hash: Commitment,
         pk: CoinPublicKey,
         coin_binding_tag: Fr,
-        commitment_sk: Fr,
+        registry_root: MerkleTreeDigest,
         client_derivation_proof: Proof,
-        attestation_proof: Proof,
         is_contract: Option<ContractAddress>,
         tree: &MerkleTree<A, D>,
     ) -> Result<SplitInput<D>, OfferCreationFailed> {
@@ -297,14 +296,11 @@ impl<D: DB> Input<ProofPreimage, D> {
             .into_iter()
             .map(|op: Op<ResultModeGather, D>| op.translate(|()| true.into())),
         );
+        // Solution A: drop the per-spend `coinCommitment` disclosure (cell 5).
+        // `coinBindingTag` shifts from cell 6 → cell 5 to match the new
+        // zswap-split.compact ledger declaration order.
         public_transcript_prog.extend(Cell_write!(
             [Key::Value(5u8.into())],
-            false,
-            [u8; 32],
-            commitment_hash.0.0
-        ));
-        public_transcript_prog.extend(Cell_write!(
-            [Key::Value(6u8.into())],
             false,
             Fr,
             coin_binding_tag
@@ -323,8 +319,9 @@ impl<D: DB> Input<ProofPreimage, D> {
                 *addr
             ));
         }
+        // Segment ledger cell shifts from 7 → 6 with `coinCommitment` removed.
         public_transcript_prog.extend(
-            Cell_read!([Key::Value(7u8.into())], false, u16)
+            Cell_read!([Key::Value(6u8.into())], false, u16)
                 .into_iter()
                 .map(|op: Op<ResultModeGather, _>| op.translate(|()| segment.unwrap_or(0).into())),
         );
@@ -369,13 +366,10 @@ impl<D: DB> Input<ProofPreimage, D> {
         Ok(SplitInput {
             input: inp,
             split_public_inputs: SplitPublicInputs {
-                public_key: pk,
-                coin_commitment: commitment_hash,
                 coin_binding_tag,
-                commitment_sk,
+                registry_root,
             },
             client_derivation_proof,
-            attestation_proof,
         })
     }
 }

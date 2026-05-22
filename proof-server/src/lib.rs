@@ -31,6 +31,32 @@ pub mod preview_client;
 pub mod versioned_ir;
 pub mod worker_pool;
 
+/// Solution A: install a registry-root checker into Zswap's admission path.
+///
+/// **Demo mode** — this installs a permissive checker that accepts any root.
+/// For the live preview e2e the synthetic single-leaf registry tree the
+/// wallet uses (`PreviewRegistryWitness::for_first_registration`) doesn't
+/// have a corresponding deployed contract whose history can be consulted, so
+/// admission accepts any well-formed `registry_root` field.
+///
+/// Production deployments must replace this with a checker that:
+///   1. reads the registry contract address from
+///      `circuits/static/wallet-registry/contract_address.txt`,
+///   2. resolves the deployed contract from the live `LedgerState`,
+///   3. extracts its `HistoricMerkleTree<20>` ledger cell, and
+///   4. returns `true` iff `root` is in that cell's root history.
+///
+/// See `tools/deploy_registry.sh` for the address-resolution step and
+/// `StateReference::wallet_registry_root_check` for the trait surface this
+/// would call into.
+pub fn install_registry_root_checker_for_demo() {
+    zswap::verify::install_registry_root_checker(Box::new(|_root| true));
+    tracing::warn!(
+        "Solution A: demo-mode registry-root checker installed (accepts all roots). \
+         Wire a real checker against the deployed registry contract for production."
+    );
+}
+
 pub fn server(port: u16, fetch_params: bool, pool: WorkerPool) -> std::io::Result<(Server, u16)> {
     let pool = Arc::new(pool);
     let http_server = HttpServer::new(move || {

@@ -139,13 +139,12 @@ pub(crate) struct SplitSpendRequest {
     zswap_state_file: Option<String>,
     prove: Option<bool>,
     client_derivation_proof: Option<String>,
-    /// v3: hex Fr (little-endian 32 bytes) — Poseidon commitment to sk from
-    /// the wallet attestation.
+    /// Solution A: hex Fr (little-endian 32 bytes) — registry-tree root the
+    /// per-spend membership path resolves to. The proof-server pre-checks
+    /// it against the client-derivation proof's public transcript, mirroring
+    /// what the node admission verifier does.
     #[serde(default)]
-    attested_commitment_sk: Option<String>,
-    /// v3: hex-encoded wallet attestation proof. Required for v3 split spends.
-    #[serde(default)]
-    attestation_proof: Option<String>,
+    registry_root: Option<String>,
     proving_data: Option<SplitProvingData>,
 }
 
@@ -256,40 +255,28 @@ pub(crate) async fn prove_split_spend(
             "split spend proof requests must include zswapState or zswapStateFile",
         ));
     }
-    // v3: parse the Poseidon `C_sk` and the bundled wallet attestation. Both
-    // are required for split spends under the v3 envelope. Pre-verify the
-    // attestation before doing any client-derivation prover work so a bad
-    // attestation fails fast.
-    let commitment_sk = request
-        .attested_commitment_sk
+    // Solution A: split spends now carry only a `registry_root` (no
+    // per-spend wallet attestation). Pre-verify the client-derivation proof
+    // before doing any prover work so a malformed spend fails fast. The node
+    // admission path adds the on-state cross-check against the registry
+    // contract's `HistoricMerkleTree` root history — see
+    // `install_registry_root_checker` in zswap/src/verify.rs.
+    let registry_root_fr = request
+        .registry_root
         .as_deref()
         .map(fr_from_hex)
         .transpose()?
         .ok_or_else(|| {
-            ErrorBadRequest("attestedCommitmentSk is required for split spend proof requests (v3)")
+            ErrorBadRequest("registryRoot is required for split spend proof requests")
         })?;
-    let attestation_proof_hex = request.attestation_proof.as_deref().ok_or_else(|| {
-        ErrorBadRequest("attestationProof is required for split spend proof requests (v3)")
-    })?;
-    info!(
-        stage = "verify-wallet-attestation",
-        role = "server",
-        "▶ SERVER/verify-wallet-attestation"
-    );
-    verify_attestation_proof(attestation_proof_hex, pk, commitment_sk).await?;
-    info!(
-        stage = "verify-wallet-attestation",
-        role = "server",
-        "✓ SERVER/verify-wallet-attestation"
-    );
+    let registry_root = transient_crypto::merkle_tree::MerkleTreeDigest(registry_root_fr);
     info!(
         stage = "verify-client-derivation",
         role = "server",
         "▶ SERVER/verify-client-derivation"
     );
     let verify_start = Instant::now();
-    verify_client_derivation_proof(&request, pk, nullifier, coin_binding_tag, commitment_sk)
-        .await?;
+    verify_client_derivation_proof(&request, nullifier, coin_binding_tag, registry_root).await?;
     let elapsed = verify_start.elapsed().as_millis();
     let server_client_deriv_verify_ms = Some(elapsed);
     info!(
@@ -305,7 +292,6 @@ pub(crate) async fn prove_split_spend(
         .transpose()?
         .map(Proof)
         .ok_or_else(|| ErrorBadRequest(MalformedOffer::MissingClientDerivationProof.to_string()))?;
-    let attestation_proof = Proof(bytes_from_hex(attestation_proof_hex)?);
 
     let split_input = Input::new_split(
         &mut OsRng,
@@ -315,9 +301,8 @@ pub(crate) async fn prove_split_spend(
         commitment_hash,
         pk,
         coin_binding_tag,
-        commitment_sk,
+        registry_root,
         client_derivation_proof,
-        attestation_proof,
         contract_address,
         &tree,
     )
@@ -504,10 +489,9 @@ fn zswap_state_from_hex(value: &str) -> Result<ZswapLedgerState<InMemoryDB>, Err
 
 async fn verify_client_derivation_proof(
     request: &SplitSpendRequest,
-    pk: CoinPublicKey,
     nullifier: Nullifier,
     coin_binding_tag: Fr,
-    commitment_sk: Fr,
+    registry_root: transient_crypto::merkle_tree::MerkleTreeDigest,
 ) -> Result<(), Error> {
     let proof_hex = request.client_derivation_proof.as_ref().ok_or_else(|| {
         ErrorBadRequest("split spend proof requests require clientDerivationProof")
@@ -519,80 +503,32 @@ async fn verify_client_derivation_proof(
     .map_err(|e| ErrorBadRequest(format!("deserialize client derivation verifier key: {e}")))?;
     let mut statement = vec![Fr::from(0u64)];
     statement.extend(client_derivation_public_transcript_inputs(
-        pk,
         nullifier.0.0,
         coin_binding_tag,
-        commitment_sk,
+        registry_root,
     ));
     verifier_key
         .verify(&PARAMS_VERIFIER, &proof, statement.into_iter())
         .map_err(|e| ErrorBadRequest(format!("invalid client derivation proof: {e}")))
 }
 
-/// v3 fast-fail attestation pre-verify. Mirrors what the node admission
-/// verifier does (`deps/midnight-ledger/zswap/src/verify.rs`) so the proof
-/// server can reject bad attestations before doing any prover work.
-async fn verify_attestation_proof(
-    attestation_proof_hex: &str,
-    pk: CoinPublicKey,
-    commitment_sk: Fr,
-) -> Result<(), Error> {
-    let proof = Proof(bytes_from_hex(attestation_proof_hex)?);
-    let verifier_key: VerifierKey =
-        tagged_deserialize(
-            &include_bytes!(
-                "../../../../circuits/static/wallet-attestation/wallet_attest.verifier"
-            )[..],
-        )
-        .map_err(|e| {
-            ErrorBadRequest(format!("deserialize wallet attestation verifier key: {e}"))
-        })?;
-    let mut statement = vec![Fr::from(0u64)];
-    statement.extend(wallet_attestation_public_transcript_inputs(
-        pk,
-        commitment_sk,
-    ));
-    verifier_key
-        .verify(&PARAMS_VERIFIER, &proof, statement.into_iter())
-        .map_err(|e| ErrorBadRequest(format!("invalid wallet attestation proof: {e}")))
-}
-
 fn client_derivation_public_transcript_inputs(
-    pk: CoinPublicKey,
     nullifier: [u8; 32],
     coin_binding_tag: Fr,
-    commitment_sk: Fr,
+    registry_root: transient_crypto::merkle_tree::MerkleTreeDigest,
 ) -> Vec<Fr> {
     let mut inputs = Vec::new();
     extend_ops(
         &mut inputs,
-        Cell_write!([Key::Value(0u8.into())], false, CoinPublicKey, pk),
+        Cell_write!([Key::Value(0u8.into())], false, [u8; 32], nullifier),
     );
     extend_ops(
         &mut inputs,
-        Cell_write!([Key::Value(1u8.into())], false, [u8; 32], nullifier),
+        Cell_write!([Key::Value(1u8.into())], false, Fr, coin_binding_tag),
     );
     extend_ops(
         &mut inputs,
-        Cell_write!([Key::Value(2u8.into())], false, Fr, coin_binding_tag),
-    );
-    // v3 cell 3 — Poseidon C_sk; cross-checked against the attestation.
-    extend_ops(
-        &mut inputs,
-        Cell_write!([Key::Value(3u8.into())], false, Fr, commitment_sk),
-    );
-    inputs
-}
-
-fn wallet_attestation_public_transcript_inputs(pk: CoinPublicKey, commitment_sk: Fr) -> Vec<Fr> {
-    let mut inputs = Vec::new();
-    extend_ops(
-        &mut inputs,
-        Cell_write!([Key::Value(0u8.into())], false, CoinPublicKey, pk),
-    );
-    extend_ops(
-        &mut inputs,
-        Cell_write!([Key::Value(1u8.into())], false, Fr, commitment_sk),
+        Cell_write!([Key::Value(2u8.into())], false, Fr, registry_root.0),
     );
     inputs
 }

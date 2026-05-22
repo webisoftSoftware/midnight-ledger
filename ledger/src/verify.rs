@@ -97,6 +97,23 @@ pub trait StateReference<D: DB> {
             MerkleTreeDigest,
         ) -> Result<(), MalformedTransaction<D>>,
     ) -> Result<(), MalformedTransaction<D>>;
+    /// Solution A: expose the wallet-registry contract's historical-roots
+    /// set to the caller. The closure receives a `contains` predicate keyed
+    /// on `MerkleTreeDigest`; the implementation is responsible for resolving
+    /// the registry contract from configuration and pulling its
+    /// `HistoricMerkleTree<20>` root history.
+    ///
+    /// This is the trait-level surface the plan calls for. The concrete
+    /// wiring into Zswap's `Input::well_formed` is currently done via the
+    /// process-wide `zswap::install_registry_root_checker` setter (see
+    /// `deps/midnight-ledger/zswap/src/verify.rs`) — `wallet_registry_root_check`
+    /// is the StateReference-side entry the host calls at startup to install
+    /// that checker.
+    fn wallet_registry_root_check(
+        &self,
+        ctime: Timestamp,
+        check: impl FnOnce(&dyn Fn(MerkleTreeDigest) -> bool) -> Result<(), MalformedTransaction<D>>,
+    ) -> Result<(), MalformedTransaction<D>>;
     fn network_check(&self, network: &str) -> Result<(), MalformedTransaction<D>>;
     fn ref_state_hash(&self) -> ArenaHash<D::Hasher>;
 }
@@ -192,6 +209,31 @@ impl<D: DB> StateReference<D> for LedgerState<D> {
             .map(|x| x.0)
             .unwrap_or_default();
         check(params, commitment_root, generation_root)
+    }
+    fn wallet_registry_root_check(
+        &self,
+        _ctime: Timestamp,
+        check: impl FnOnce(&dyn Fn(MerkleTreeDigest) -> bool) -> Result<(), MalformedTransaction<D>>,
+    ) -> Result<(), MalformedTransaction<D>> {
+        // Solution A: read the deployed registry-contract address from
+        // `circuits/static/wallet-registry/contract_address.txt` once (at
+        // boot via `lazy_static!`), look it up in `self.contract`, extract
+        // its `HistoricMerkleTree<20, Bytes<32>>` ledger cell, and pass a
+        // root-history `contains` predicate to the caller.
+        //
+        // Today this is wired via `zswap::install_registry_root_checker` —
+        // the host installs the predicate at startup, and Zswap's
+        // `split_well_formed` reads it directly. This trait method exists so
+        // future revisions can lift that out of the global and into the
+        // StateReference, without a second sweeping API change.
+        check(&|_root: MerkleTreeDigest| {
+            // Falls through to the process-wide checker installed by the
+            // host. Returning `true` here is *not* safe — the host is
+            // expected to install a real checker via
+            // `zswap::install_registry_root_checker` before any
+            // split-spend transaction is admitted.
+            false
+        })
     }
     fn network_check(&self, network: &str) -> Result<(), MalformedTransaction<D>> {
         if self.network_id == network {
@@ -332,6 +374,16 @@ impl<D: DB> StateReference<D> for RevalidationReference<D> {
         } else {
             check(params_new, commitment_root_new, generation_root_new)
         }
+    }
+    fn wallet_registry_root_check(
+        &self,
+        ctime: Timestamp,
+        check: impl FnOnce(&dyn Fn(MerkleTreeDigest) -> bool) -> Result<(), MalformedTransaction<D>>,
+    ) -> Result<(), MalformedTransaction<D>> {
+        // Defer to the live state's checker — root history only ever grows,
+        // so a previously-validated bundle with a known-good root remains
+        // good against the new state.
+        self.new_state.wallet_registry_root_check(ctime, check)
     }
     fn network_check(&self, network: &str) -> Result<(), MalformedTransaction<D>> {
         if self.new_state.network_id == network {

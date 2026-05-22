@@ -23,10 +23,15 @@ ledger nullifiers: Set<Bytes<32>>;
 ledger valueCom: JubjubPoint;
 ledger contractAddr: ContractAddress;
 ledger publicKey: ZswapCoinPublicKey;
-ledger coinCommitment: Bytes<32>;
 ledger coinBindingTag: Field;
 ledger segment: Uint<16>;
 
+// Solution A: drop the per-spend disclosure of `coinCommitment`. Stock Zswap's
+// spend circuit never publishes the coin commitment either; we restore that
+// parity here. Membership of the coin commitment in the Zswap merkle tree is
+// still enforced in-circuit by the path check + leaf equality below, and
+// `coinBindingTag` is what anchors this server proof to the client's per-spend
+// proof over the same `(coin, pk)`.
 export circuit spendSplitUser(
   pk: ZswapCoinPublicKey,
   path: MerkleTreePath<32, Bytes<32>>,
@@ -43,7 +48,7 @@ export circuit spendSplitUser(
       data: pk.bytes,
     });
   assert(coinCom == path.leaf, "Path must be to coin commitment");
-  coinCommitment = disclose(coinCom);
+
   coinBindingTag = disclose(transientHash<SplitCoinBindingPreimage>(
     SplitCoinBindingPreimage {
       sep: "midnight:zswap-split-coin[v1]" as Field,
@@ -59,6 +64,9 @@ export circuit spendSplitUser(
   valueCom = disclose(ecAdd(pedersenBlinding, pedersenCommit));
 }
 
+// signSplitUser still discloses `publicKey` (cell 4) — required by
+// `AuthorizedClaim::well_formed`. Only the spend side dropped its
+// `publicKey`/`coinCommitment` disclosures.
 export circuit signSplitUser(pk: ZswapCoinPublicKey): [] {
   publicKey = disclose(pk);
 }

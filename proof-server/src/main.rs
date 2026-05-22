@@ -61,6 +61,7 @@ struct Args {
 async fn main() -> std::io::Result<()> {
     let args = Args::parse();
     init_logging(args.verbose);
+    midnight_proof_server::install_registry_root_checker_for_demo();
     if !args.no_fetch_params {
         info!("Ensuring zswap key material is available...");
         let resolver = Resolver::new(

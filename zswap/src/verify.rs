@@ -30,6 +30,7 @@ use storage::db::InMemoryDB;
 use storage::{Storable, arena::Sp};
 use transient_crypto::commitment::Pedersen;
 use transient_crypto::curve::{EmbeddedFr, EmbeddedGroupAffine, Fr};
+use transient_crypto::merkle_tree::MerkleTreeDigest;
 #[cfg(feature = "proof-verifying")]
 use transient_crypto::hash::transient_commit;
 use transient_crypto::proofs::PARAMS_VERIFIER;
@@ -62,8 +63,9 @@ const SPEND_VK_RAW: &[u8] = include_bytes!("../static/spend.verifier");
 const SPEND_SPLIT_VK_RAW: &[u8] = include_bytes!("../static/spend-split.verifier");
 #[cfg(feature = "proof-verifying")]
 const CLIENT_DERIVATION_VK_RAW: &[u8] = include_bytes!("../static/client-derivation.verifier");
-#[cfg(feature = "proof-verifying")]
-const WALLET_ATTESTATION_VK_RAW: &[u8] = include_bytes!("../static/wallet-attestation.verifier");
+// Solution A: the wallet attestation proof no longer travels with split-spend
+// bundles; per-spend admission only checks the client-derivation proof and
+// the registry-root cross-check installed via `install_registry_root_checker`.
 #[cfg(feature = "proof-verifying")]
 const SIGN_VK_RAW: &[u8] = include_bytes!("../static/sign.verifier");
 #[cfg(feature = "proof-verifying")]
@@ -83,9 +85,6 @@ lazy_static! {
     pub static ref CLIENT_DERIVATION_VK: VerifierKey =
         tagged_deserialize(&mut CLIENT_DERIVATION_VK_RAW.to_vec().as_slice())
             .expect("Zswap Client Derivation VK should be valid");
-    pub static ref WALLET_ATTESTATION_VK: VerifierKey =
-        tagged_deserialize(&mut WALLET_ATTESTATION_VK_RAW.to_vec().as_slice())
-            .expect("Zswap Wallet Attestation VK should be valid");
     pub static ref SIGN_VK: VerifierKey = tagged_deserialize(&mut SIGN_VK_RAW.to_vec().as_slice())
         .expect("Zswap Sign VK should be valid");
     pub static ref SIGN_SPLIT_VK: VerifierKey =
@@ -169,6 +168,60 @@ impl AuthorizedClaim<Proof> {
     }
 }
 
+/// Process-wide registry-root checker injected by the host (proof-server /
+/// node admission) at startup. The host loads the registry contract address
+/// from `circuits/static/wallet-registry/contract_address.txt` once and
+/// installs a closure that:
+///   1. resolves the registry contract from the current ledger state,
+///   2. extracts its `HistoricMerkleTree<20>` ledger cell,
+///   3. returns `true` iff `root` is in that cell's root history.
+///
+/// `split_well_formed` invokes the installed closure during admission. If no
+/// checker has been installed the admission fails closed —
+/// `MalformedSplitProofBundle` — protecting against tests that forget to
+/// install the wiring.
+///
+/// This avoids threading `&dyn StateReference` through the zswap → ledger
+/// crate boundary, which would require an invasive trait bound on every
+/// `well_formed` callsite. The plan's `wallet_registry_root_check` lives in
+/// the ledger crate and is what *installs* this closure.
+pub type RegistryRootChecker = Box<dyn Fn(MerkleTreeDigest) -> bool + Send + Sync>;
+
+lazy_static! {
+    static ref REGISTRY_ROOT_CHECKER: std::sync::RwLock<Option<RegistryRootChecker>> =
+        std::sync::RwLock::new(None);
+}
+
+/// Install a registry-root checker. Idempotent — calling twice replaces the
+/// previously-installed checker. Intended to be called once at process boot
+/// after the registry contract address has been read from configuration.
+pub fn install_registry_root_checker(checker: RegistryRootChecker) {
+    *REGISTRY_ROOT_CHECKER
+        .write()
+        .expect("registry root checker mutex poisoned") = Some(checker);
+}
+
+/// Clear the installed checker (mainly for tests).
+pub fn clear_registry_root_checker() {
+    *REGISTRY_ROOT_CHECKER
+        .write()
+        .expect("registry root checker mutex poisoned") = None;
+}
+
+fn check_registry_root(root: MerkleTreeDigest) -> Result<(), MalformedOffer> {
+    let guard = REGISTRY_ROOT_CHECKER
+        .read()
+        .expect("registry root checker mutex poisoned");
+    match guard.as_ref() {
+        Some(check) if check(root) => Ok(()),
+        Some(_) => Err(MalformedOffer::MalformedSplitProofBundle),
+        // No checker installed → fail closed. The proof-server / node admission
+        // path is responsible for calling `install_registry_root_checker`
+        // before verifying any split-spend transaction.
+        None => Err(MalformedOffer::MalformedSplitProofBundle),
+    }
+}
+
 impl<D: DB> Input<Proof, D> {
     #[cfg(not(feature = "proof-verifying"))]
     pub fn well_formed(&self, _segment: u16) -> Result<(), MalformedOffer> {
@@ -231,29 +284,28 @@ impl<D: DB> Input<Proof, D> {
         split_bundle: &SplitProofBundle,
     ) -> Result<(), MalformedOffer> {
         let split = &split_bundle.split_public_inputs;
-        // v3 admission chain (plain Rust verification, no recursion in-circuit):
-        //   (i)  attestation proof → asserts `pk == H(sk) ∧ C_sk == H(sk, r)`
-        //        (Plan §"Soundness argument" step 1)
-        //   (ii) client-derivation proof → opens `C_sk` to recover `sk`, then
-        //        computes the canonical nullifier and coin-binding tag from
-        //        that `sk` (Plan §"Soundness argument" steps 3–5)
-        //   (iii) cross-checks across the two proofs:
-        //        - both disclose the same `pk` (re-used as
-        //          `split.public_key` here),
-        //        - both disclose the same `commitment_sk` (re-used as
-        //          `split.commitment_sk` here),
-        //        which together force `sk` to be the same byte string on both
-        //        sides under Poseidon binding (Plan §"Encoding pitfall").
-        verify_wallet_attestation_proof(
-            split.public_key,
-            split.commitment_sk,
-            &split_bundle.attestation_proof,
-        )?;
+        // Solution A admission chain:
+        //   (i)  client-derivation proof — proves the per-spend nullifier and
+        //        coin_binding_tag came from a wallet whose `reg_leaf` is a
+        //        Merkle-path member rooted at `split.registry_root`. The
+        //        client circuit binds `nullifier`, `coinBindingTag` and
+        //        `registryRoot` to a single `(sk, r, salt, pk, coin, path)`
+        //        witness tuple under Poseidon binding for `C_sk` and
+        //        `reg_leaf`.
+        //   (ii) registry-root cross-check — `split.registry_root` must
+        //        currently be in the registry contract's `HistoricMerkleTree`
+        //        root history. Soundness of (i) without (ii) is vacuous —
+        //        an attacker could supply any made-up root.
+        //   (iii) spend-split proof — the existing server-side circuit, now
+        //        with `publicKey`/`coinCommitment` ledger cells dropped (see
+        //        `deps/midnight-ledger/zswap/zswap-split.compact`). Binds the
+        //        Zswap merkle membership of the spent coin and value commit.
         verify_client_derivation_proof(
             split,
             &split_bundle.client_derivation_proof,
             self.nullifier,
         )?;
+        check_registry_root(split.registry_root)?;
 
         let mut split_prog = Vec::new();
         split_prog.extend::<[Op<ResultModeGather, InMemoryDB>; 6]>(HistoricMerkleTree_check_root!(
@@ -263,14 +315,12 @@ impl<D: DB> Input<Proof, D> {
             [u8; 32],
             self.merkle_tree_root
         ));
+        // Solution A cell layout (zswap-split.compact ledger declaration order):
+        //   0: merkleTree, 1: nullifiers, 2: valueCom, 3: contractAddr,
+        //   4: publicKey (kept for signSplitUser), 5: coinBindingTag,
+        //   6: segment. The previous `coinCommitment` cell (was 5) is gone.
         split_prog.extend(Cell_write!(
             [Key::Value(5u8.into())],
-            false,
-            [u8; 32],
-            split.coin_commitment.0.0
-        ));
-        split_prog.extend(Cell_write!(
-            [Key::Value(6u8.into())],
             false,
             Fr,
             split.coin_binding_tag
@@ -289,7 +339,7 @@ impl<D: DB> Input<Proof, D> {
                 *addr.deref()
             ));
         }
-        split_prog.extend(Cell_read!([Key::Value(7u8.into())], false, u16));
+        split_prog.extend(Cell_read!([Key::Value(6u8.into())], false, u16));
         split_prog.extend(Cell_write!(
             [Key::Value(2u8.into())],
             false,
@@ -321,10 +371,9 @@ fn verify_client_derivation_proof(
 ) -> Result<(), MalformedOffer> {
     let mut statement = vec![Fr::from(0u64)];
     statement.extend(client_derivation_public_transcript_inputs(
-        split.public_key,
         nullifier.0.0,
         split.coin_binding_tag,
-        split.commitment_sk,
+        split.registry_root,
     ));
     CLIENT_DERIVATION_VK
         .verify(&PARAMS_VERIFIER, proof, statement.into_iter())
@@ -332,75 +381,28 @@ fn verify_client_derivation_proof(
 }
 
 #[cfg(feature = "proof-verifying")]
-fn verify_wallet_attestation_proof(
-    pk: coin_structure::coin::PublicKey,
-    commitment_sk: Fr,
-    proof: &Proof,
-) -> Result<(), MalformedOffer> {
-    let mut statement = vec![Fr::from(0u64)];
-    statement.extend(wallet_attestation_public_transcript_inputs(
-        pk,
-        commitment_sk,
-    ));
-    WALLET_ATTESTATION_VK
-        .verify(&PARAMS_VERIFIER, proof, statement.into_iter())
-        .map_err(MalformedOffer::InvalidProof)
-}
-
-/// Mirror of the public-input cells declared by
-/// `circuits/wallet_attestation.compact`: cell 0 → `pk`, cell 1 → `commitmentSk`.
-#[cfg(feature = "proof-verifying")]
-fn wallet_attestation_public_transcript_inputs(
-    pk: coin_structure::coin::PublicKey,
-    commitment_sk: Fr,
-) -> Vec<Fr> {
-    let mut inputs = Vec::new();
-    extend_ops(
-        &mut inputs,
-        Cell_write!(
-            [Key::Value(0u8.into())],
-            false,
-            coin_structure::coin::PublicKey,
-            pk
-        ),
-    );
-    extend_ops(
-        &mut inputs,
-        Cell_write!([Key::Value(1u8.into())], false, Fr, commitment_sk),
-    );
-    inputs
-}
-
-#[cfg(feature = "proof-verifying")]
 fn client_derivation_public_transcript_inputs(
-    pk: coin_structure::coin::PublicKey,
     nullifier: [u8; 32],
     coin_binding_tag: Fr,
-    commitment_sk: Fr,
+    registry_root: MerkleTreeDigest,
 ) -> Vec<Fr> {
     let mut inputs = Vec::new();
+    // Solution A `sk_proof.compact` ledger declaration order:
+    //   cell 0 → nullifier (Bytes<32>),
+    //   cell 1 → coinBindingTag (Field),
+    //   cell 2 → registryRoot (MerkleTreeDigest — lowers to a single Field
+    //            ledger cell with Field alignment).
     extend_ops(
         &mut inputs,
-        Cell_write!(
-            [Key::Value(0u8.into())],
-            false,
-            coin_structure::coin::PublicKey,
-            pk
-        ),
+        Cell_write!([Key::Value(0u8.into())], false, [u8; 32], nullifier),
     );
     extend_ops(
         &mut inputs,
-        Cell_write!([Key::Value(1u8.into())], false, [u8; 32], nullifier),
+        Cell_write!([Key::Value(1u8.into())], false, Fr, coin_binding_tag),
     );
     extend_ops(
         &mut inputs,
-        Cell_write!([Key::Value(2u8.into())], false, Fr, coin_binding_tag),
-    );
-    // v3 cell 3 — Poseidon commitment to sk; cross-checked against the
-    // attestation's public output.
-    extend_ops(
-        &mut inputs,
-        Cell_write!([Key::Value(3u8.into())], false, Fr, commitment_sk),
+        Cell_write!([Key::Value(2u8.into())], false, Fr, registry_root.0),
     );
     inputs
 }

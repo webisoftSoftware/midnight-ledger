@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use base_crypto::data_provider::{FetchMode, MidnightDataProvider, OutputMode};
+use base_crypto::hash::HashOutput;
 use coin_structure::coin::{Commitment, Info as CoinInfo, Nullifier, PublicKey as CoinPublicKey};
 use coin_structure::transfer::SenderEvidence;
 use ledger::events::{Event, EventDetails};
@@ -27,6 +28,8 @@ use storage::storage::HashMap as StorageHashMap;
 use transient_crypto::commitment::{PedersenRandomness, PureGeneratorPedersen};
 use transient_crypto::curve::Fr;
 use transient_crypto::encryption;
+use transient_crypto::hash::{degrade_to_transient, transient_hash, upgrade_from_transient};
+use transient_crypto::merkle_tree::{MerklePath, MerkleTree, MerkleTreeDigest};
 use transient_crypto::proofs::{
     KeyLocation, ParamsProver, ParamsProverProvider, Proof, ProofPreimage, ProvingKeyMaterial,
     Resolver,
@@ -40,12 +43,17 @@ use zswap::{Delta, Input, Offer as ZswapOffer, Output as ZswapOutput, split_coin
 
 pub type PreviewResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 const CLIENT_DERIVATION_KEY_LOCATION: &str = "split/client/sk-derivation";
-/// v3: one-time-per-wallet attestation circuit. Mirror of
-/// `split-prove-prototype::attestation::WALLET_ATTESTATION_KEY_LOCATION`.
+/// Solution A wallet-attestation circuit (off-chain sanity check; not
+/// submitted on-chain — the registry contract takes only `reg_leaf` bytes).
 const WALLET_ATTESTATION_KEY_LOCATION: &str = "split/wallet/attestation";
-/// v3 Poseidon `C_sk` separator. Must match the immediate loaded in
-/// `circuits/wallet_attestation.compact` and `circuits/sk_proof.compact`.
+/// Domain separator for the Poseidon `C_sk` commitment.
 const SK_COMMIT_SEPARATOR: &str = "midnight:sk-commit[v1]";
+/// Domain separator for the registration leaf `reg_leaf`.
+const REG_LEAF_SEPARATOR: &str = "midnight:wallet-reg[v1]";
+/// Height of the wallet-registry Merkle tree. Mirror of
+/// `split_prove::client::REGISTRY_TREE_HEIGHT` and the constant baked into
+/// `circuits/wallet_registry.compact` / `sk_proof.compact`.
+const REGISTRY_TREE_HEIGHT: u8 = 20;
 const DEFAULT_PREVIEW_TRANSFER_AMOUNT: u128 = 500 * 1_000_000;
 
 pub fn split_nullifier(coin: &CoinInfo, sk: &coin_structure::coin::SecretKey) -> Nullifier {
@@ -227,11 +235,13 @@ pub fn print_staged_report(report: &PreviewSplitProveReport) {
     println!();
     println!("--- Role boundary check ---");
     println!("  sk crossed the wire?                                    NO");
-    println!("  r (attestation blinding) crossed the wire?              NO");
+    println!("  r (Poseidon C_sk blinding) crossed the wire?            NO");
+    println!("  salt (reg-leaf blinding) crossed the wire?              NO");
+    println!("  merkle_path crossed the wire?                           NO");
     println!("  what crossed (ClientHandoff): coinBindingTag, nullifier, pk,");
     println!("                commitmentHash, coinValue, coinType, coinNonce,");
     println!("                mtIndex, contractAddress, clientDerivationProof,");
-    println!("                attestedCommitmentSk, attestationProof");
+    println!("                registryRoot");
     println!();
 }
 
@@ -513,32 +523,43 @@ pub async fn build_split_spend_handoff_timed(
     let pk = spend.key.coin_secret_key.public_key();
     let coin_binding_tag = split_coin_binding_tag(&spend.coin, pk);
 
-    // v3: one-time wallet attestation. In a real wallet this is generated at
-    // registration time and reused across every spend; the preview e2e
-    // generates it fresh per run so the demo is self-contained.
+    // Solution A wallet registration. In a real wallet this is generated once
+    // at setup, persisted, and reused across every spend; the preview e2e
+    // generates it fresh per run so the demo is self-contained. The
+    // attestation proof itself is *not* submitted on-chain — the
+    // contract-side `register(reg_leaf)` call accepts the leaf bytes and the
+    // permissioning argument makes attestation-proof verification
+    // unnecessary at admission time.
     let attestation_start = Instant::now();
-    let attestation = prove_wallet_attestation(&spend.key.coin_secret_key).await?;
+    let registration = prove_wallet_attestation(&spend.key.coin_secret_key).await?;
     let attestation_elapsed = attestation_start.elapsed();
 
-    debug_assert_eq!(
-        attestation.pk, pk,
-        "attestation pk must match the spend's pk"
-    );
+    // Build a single-leaf registry tree mirroring the registry contract's
+    // state after this wallet's `register(reg_leaf)` call. For now the
+    // preview e2e uses this synthetic in-memory tree; once the contract is
+    // deployed we'll read the live tree state instead (Phase 10 wires
+    // `install_registry_root_checker` against the same tree state).
+    let registry_witness = build_first_registration_witness(&registration)?;
 
     let proving_start = Instant::now();
     let client_derivation_proof =
-        prove_client_derivation(spend, coin_binding_tag, pk, &attestation).await?;
+        prove_client_derivation(spend, coin_binding_tag, pk, &registration, &registry_witness)
+            .await?;
     let client_derivation_elapsed = proving_start.elapsed();
 
     // The user-facing `derive_local_proving` timing counts only the per-spend
-    // client proof — the attestation is a one-time setup cost, not a per-spend
-    // proof, so we don't roll it in. We still log it so it's visible.
+    // client proof — the attestation is a one-time setup cost, not a
+    // per-spend proof, so we don't roll it in. We still log it so it's
+    // visible.
     tracing::info!(
         stage = "wallet-attestation",
         role = "client",
         elapsed_ms = attestation_elapsed.as_millis() as u64,
         "✓ CLIENT/wallet-attestation (one-time)"
     );
+
+    let registry_root_hex =
+        hex::encode(registry_witness.registry_root.0.as_le_bytes());
 
     Ok((
         json!({
@@ -554,10 +575,11 @@ pub async fn build_split_spend_handoff_timed(
             "zswapState": hex::encode(zswap_state_bytes),
             "prove": true,
             "clientDerivationProof": hex::encode(client_derivation_proof.0),
-            // v3 additions — required by the proof server's /v2/prove-split-spend
-            // endpoint and by the node admission verifier.
-            "attestedCommitmentSk": hex::encode(attestation.commitment_sk.0.to_bytes_le()),
-            "attestationProof": hex::encode(attestation.proof.0),
+            // Solution A: the only wallet-identifying public input is the
+            // registry root the per-spend membership path resolves to. The
+            // bundle no longer carries pk / attested_commitment_sk /
+            // attestation_proof.
+            "registryRoot": registry_root_hex,
         }),
         client_derivation_elapsed,
     ))
@@ -955,9 +977,11 @@ async fn prove_client_derivation(
     spend: &PreviewWalletSpend,
     coin_binding_tag: Fr,
     pk: CoinPublicKey,
-    attestation: &PreviewWalletAttestation,
+    registration: &PreviewWalletRegistration,
+    witness: &PreviewRegistryWitness,
 ) -> PreviewResult<transient_crypto::proofs::Proof> {
-    let preimage = build_client_derivation_preimage(spend, coin_binding_tag, pk, attestation);
+    let preimage =
+        build_client_derivation_preimage(spend, coin_binding_tag, pk, registration, witness);
     let resolver = ClientDerivationResolver::new(ZswapResolver(
         MidnightDataProvider::new(
             FetchMode::OnDemand,
@@ -977,26 +1001,28 @@ fn build_client_derivation_preimage(
     spend: &PreviewWalletSpend,
     coin_binding_tag: Fr,
     pk: CoinPublicKey,
-    attestation: &PreviewWalletAttestation,
+    registration: &PreviewWalletRegistration,
+    witness: &PreviewRegistryWitness,
 ) -> ProofPreimage {
-    // v3 witness layout matches `circuits/sk_proof.compact`'s parameter
-    // declaration order: (sk, pk, r, coin).
+    // Solution A witness layout matches `circuits/sk_proof.compact` parameter
+    // declaration order: (sk, pk, r, salt, coin, merkle_path).
     let mut inputs = Vec::new();
-    spend.key.coin_secret_key.0.0.field_repr(&mut inputs); // sk → 2 Fr limbs
-    pk.0.0.field_repr(&mut inputs); // pk → 2 Fr limbs
-    inputs.push(attestation.blinding); // r → 1 Fr
-    spend.coin.nonce.0.0.field_repr(&mut inputs); // coin.nonce → 2 Fr limbs
-    spend.coin.type_.0.0.field_repr(&mut inputs); // coin.color → 2 Fr limbs
-    spend.coin.value.field_repr(&mut inputs); // coin.value → 1 Fr
+    spend.key.coin_secret_key.0.0.field_repr(&mut inputs); // sk - 2 Fr
+    pk.0.0.field_repr(&mut inputs); // pk - 2 Fr
+    inputs.push(registration.blinding); // r - 1 Fr
+    inputs.push(registration.salt); // salt - 1 Fr
+    spend.coin.nonce.0.0.field_repr(&mut inputs); // nonce - 2 Fr
+    spend.coin.type_.0.0.field_repr(&mut inputs); // color - 2 Fr
+    spend.coin.value.field_repr(&mut inputs); // value - 1 Fr
+    witness.merkle_path.field_repr(&mut inputs); // leaf + 20 entries
 
     ProofPreimage {
         inputs,
         private_transcript: Vec::new(),
         public_transcript_inputs: client_derivation_public_transcript_inputs(
-            pk,
             spend.nullifier.0.0,
             coin_binding_tag,
-            attestation.commitment_sk,
+            witness.registry_root.0,
         ),
         public_transcript_outputs: Vec::new(),
         binding_input: 0.into(),
@@ -1006,56 +1032,93 @@ fn build_client_derivation_preimage(
 }
 
 fn client_derivation_public_transcript_inputs(
-    pk: CoinPublicKey,
     nullifier: [u8; 32],
     coin_binding_tag: Fr,
-    commitment_sk: Fr,
+    registry_root: Fr,
 ) -> Vec<Fr> {
+    // Mirrors `sk_proof.compact` ledger declaration order:
+    //   cell 0: nullifier (Bytes<32>)
+    //   cell 1: coinBindingTag (Field)
+    //   cell 2: registryRoot (MerkleTreeDigest lowers to Field cell)
     let mut inputs = Vec::new();
     extend_ops(
         &mut inputs,
-        Cell_write!([Key::Value(0u8.into())], false, CoinPublicKey, pk),
+        Cell_write!([Key::Value(0u8.into())], false, [u8; 32], nullifier),
     );
     extend_ops(
         &mut inputs,
-        Cell_write!([Key::Value(1u8.into())], false, [u8; 32], nullifier),
+        Cell_write!([Key::Value(1u8.into())], false, Fr, coin_binding_tag),
     );
     extend_ops(
         &mut inputs,
-        Cell_write!([Key::Value(2u8.into())], false, Fr, coin_binding_tag),
-    );
-    // v3 cell 3 — Poseidon C_sk; cross-checked by the admission verifier
-    // against the attestation's commitment_sk public output.
-    extend_ops(
-        &mut inputs,
-        Cell_write!([Key::Value(3u8.into())], false, Fr, commitment_sk),
+        Cell_write!([Key::Value(2u8.into())], false, Fr, registry_root),
     );
     inputs
 }
 
-/// v3 wallet attestation produced once at the start of a preview run and
-/// reused for every spend in that run. Mirrors
-/// `split-prove-prototype::attestation::WalletAttestation`.
+/// Solution A wallet registration produced once per preview run. The bytes
+/// are submitted to the registry contract; the Fr is the in-circuit
+/// `regLeaf` value; the proof is off-chain evidence (not part of any
+/// split bundle).
 #[derive(Debug, Clone)]
-pub(crate) struct PreviewWalletAttestation {
-    pub pk: CoinPublicKey,
-    pub commitment_sk: Fr,
+pub(crate) struct PreviewWalletRegistration {
     pub blinding: Fr,
-    pub proof: Proof,
+    pub salt: Fr,
+    /// In-circuit `regLeaf` Field. Kept for diagnostics — the upgrade
+    /// (`reg_leaf_bytes`) is what travels off-circuit.
+    #[allow(dead_code)]
+    pub reg_leaf_fr: Fr,
+    pub reg_leaf_bytes: [u8; 32],
+    /// Attestation proof generated during registration. Kept on the
+    /// wallet as off-chain evidence; never bundled with split spends.
+    #[allow(dead_code)]
+    pub attestation_proof: Proof,
 }
 
-/// Off-circuit derivation of `(pk, C_sk)` from `(sk, r)`. Byte-identical to
-/// what the attestation circuit computes — Compact decomposes `Bytes<32>` into
-/// an 8-bit limb followed by a 248-bit limb, the same two Fr values
-/// `sk.0.0.field_repr()` produces here.
-fn derive_attestation_outputs(sk: &coin_structure::coin::SecretKey, r: Fr) -> (CoinPublicKey, Fr) {
-    let pk = sk.public_key();
+/// Single-leaf registry witness mirroring the registry contract's state
+/// after this wallet's first `register` call resolves.
+#[derive(Debug, Clone)]
+pub(crate) struct PreviewRegistryWitness {
+    pub merkle_path: MerklePath<((), HashOutput)>,
+    pub registry_root: MerkleTreeDigest,
+}
+
+fn build_first_registration_witness(
+    registration: &PreviewWalletRegistration,
+) -> PreviewResult<PreviewRegistryWitness> {
+    let leaf_hash = HashOutput(registration.reg_leaf_bytes);
+    let mt = MerkleTree::<(), InMemoryDB>::blank(REGISTRY_TREE_HEIGHT)
+        .update_hash(0, leaf_hash, ())
+        .rehash();
+    let merkle_path = mt
+        .path_for_leaf(0, ((), leaf_hash))
+        .map_err(|e| format!("registry path_for_leaf failed: {e}"))?;
+    // Apply `merkleTreePathRootNoLeafHash` semantics (no extra leaf-hash).
+    let registry_root = MerkleTreeDigest(merkle_path.path.iter().fold(
+        degrade_to_transient(leaf_hash),
+        |acc, entry| {
+            if entry.goes_left {
+                transient_hash(&[acc, entry.sibling.0])
+            } else {
+                transient_hash(&[entry.sibling.0, acc])
+            }
+        },
+    ));
+    Ok(PreviewRegistryWitness {
+        merkle_path,
+        registry_root,
+    })
+}
+
+fn derive_reg_leaf(sk: &coin_structure::coin::SecretKey, r: Fr, salt: Fr) -> (Fr, Fr) {
     let mut sk_limbs = Vec::new();
     sk.0.0.field_repr(&mut sk_limbs);
     debug_assert_eq!(sk_limbs.len(), 2, "Bytes<32> must produce 2 Fr limbs");
-    let sep = ascii_to_fr_le(SK_COMMIT_SEPARATOR);
-    let commitment_sk = transient_crypto::hash::transient_hash(&[sep, sk_limbs[0], sk_limbs[1], r]);
-    (pk, commitment_sk)
+    let sep_sk = ascii_to_fr_le(SK_COMMIT_SEPARATOR);
+    let c_sk_fr = transient_hash(&[sep_sk, sk_limbs[0], sk_limbs[1], r]);
+    let sep_reg = ascii_to_fr_le(REG_LEAF_SEPARATOR);
+    let reg_leaf_fr = transient_hash(&[sep_reg, c_sk_fr, salt]);
+    (c_sk_fr, reg_leaf_fr)
 }
 
 fn ascii_to_fr_le(s: &str) -> Fr {
@@ -1069,16 +1132,17 @@ fn ascii_to_fr_le(s: &str) -> Fr {
 fn build_wallet_attestation_preimage(
     sk: &coin_structure::coin::SecretKey,
     r: Fr,
-    pk: CoinPublicKey,
-    commitment_sk: Fr,
+    salt: Fr,
+    reg_leaf_fr: Fr,
 ) -> ProofPreimage {
     let mut inputs = Vec::new();
     sk.0.0.field_repr(&mut inputs);
     inputs.push(r);
+    inputs.push(salt);
     ProofPreimage {
         inputs,
         private_transcript: Vec::new(),
-        public_transcript_inputs: wallet_attestation_public_transcript_inputs(pk, commitment_sk),
+        public_transcript_inputs: wallet_attestation_public_transcript_inputs(reg_leaf_fr),
         public_transcript_outputs: Vec::new(),
         binding_input: 0.into(),
         communications_commitment: None,
@@ -1086,28 +1150,26 @@ fn build_wallet_attestation_preimage(
     }
 }
 
-fn wallet_attestation_public_transcript_inputs(pk: CoinPublicKey, commitment_sk: Fr) -> Vec<Fr> {
+fn wallet_attestation_public_transcript_inputs(reg_leaf_fr: Fr) -> Vec<Fr> {
     let mut inputs = Vec::new();
     extend_ops(
         &mut inputs,
-        Cell_write!([Key::Value(0u8.into())], false, CoinPublicKey, pk),
-    );
-    extend_ops(
-        &mut inputs,
-        Cell_write!([Key::Value(1u8.into())], false, Fr, commitment_sk),
+        Cell_write!([Key::Value(0u8.into())], false, Fr, reg_leaf_fr),
     );
     inputs
 }
 
-/// Generate the per-run wallet attestation. Live e2e runs this once per
-/// preview run and reuses the result on every spend; in real wallets this
-/// would happen once at setup and persist.
+/// Generate the per-run wallet registration. Live e2e runs this once and
+/// reuses the result on every spend in that run.
 pub(crate) async fn prove_wallet_attestation(
     sk: &coin_structure::coin::SecretKey,
-) -> PreviewResult<PreviewWalletAttestation> {
+) -> PreviewResult<PreviewWalletRegistration> {
     let r: Fr = OsRng.r#gen();
-    let (pk, commitment_sk) = derive_attestation_outputs(sk, r);
-    let preimage = build_wallet_attestation_preimage(sk, r, pk, commitment_sk);
+    let salt: Fr = OsRng.r#gen();
+    let (_c_sk_fr, reg_leaf_fr) = derive_reg_leaf(sk, r, salt);
+    let reg_leaf_bytes = upgrade_from_transient(reg_leaf_fr).0;
+
+    let preimage = build_wallet_attestation_preimage(sk, r, salt, reg_leaf_fr);
     let resolver = ClientDerivationResolver::new(ZswapResolver(
         MidnightDataProvider::new(
             FetchMode::OnDemand,
@@ -1120,11 +1182,12 @@ pub(crate) async fn prove_wallet_attestation(
         .prove::<zkir::IrSource>(OsRng, &resolver, &resolver)
         .await
         .map_err(|e| format!("wallet attestation proof failed: {e}"))?;
-    Ok(PreviewWalletAttestation {
-        pk,
-        commitment_sk,
+    Ok(PreviewWalletRegistration {
         blinding: r,
-        proof,
+        salt,
+        reg_leaf_fr,
+        reg_leaf_bytes,
+        attestation_proof: proof,
     })
 }
 

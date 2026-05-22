@@ -616,56 +616,34 @@ mod split_spend_endpoint {
             ZswapInputProof::Plain(_) => panic!("proved input must carry split proof envelope"),
         };
         let expected_tag = zswap::split_coin_binding_tag(&spend.coin, spend.key.coin_public_key());
-        assert_eq!(bundle.split_public_inputs.coin_commitment, spend.commitment);
-        assert_eq!(
-            bundle.split_public_inputs.public_key,
-            spend.key.coin_public_key()
-        );
+        // Solution A: SplitPublicInputs no longer carries `public_key` or
+        // `coin_commitment`. Wallet identity flows entirely through
+        // `registry_root` and `coin_binding_tag`.
         assert_eq!(bundle.split_public_inputs.coin_binding_tag, expected_tag);
+
+        // Install a registry-root checker that accepts only this exact
+        // bundle's registry_root. Tests that tamper with the root rely on
+        // this being a *single*-root acceptor.
+        let admissible_root = bundle.split_public_inputs.registry_root;
+        zswap::verify::install_registry_root_checker(Box::new(move |root| {
+            root == admissible_root
+        }));
+
         proved_input
             .well_formed(0)
-            .expect("ledger verifier accepts split input with both proofs");
+            .expect("ledger verifier accepts split input with client-derivation proof and registered root");
 
-        let mut tampered_pk = proved_input.clone();
-        let mut tampered_pk_bundle = bundle.clone();
-        tampered_pk_bundle.split_public_inputs.public_key = coin::PublicKey(HashOutput([9u8; 32]));
-        tampered_pk.proof =
-            std::sync::Arc::new(ZswapInputProof::Split(tampered_pk_bundle).encode());
+        let mut tampered_registry_root = proved_input.clone();
+        let mut tampered_registry_root_bundle = bundle.clone();
+        tampered_registry_root_bundle.split_public_inputs.registry_root =
+            transient_crypto::merkle_tree::MerkleTreeDigest(
+                transient_crypto::curve::Fr::from(0xdead_beef_u64),
+            );
+        tampered_registry_root.proof =
+            std::sync::Arc::new(ZswapInputProof::Split(tampered_registry_root_bundle).encode());
         assert!(
-            tampered_pk.well_formed(0).is_err(),
-            "ledger verifier must reject a split bundle whose pk no longer matches the attestation/client proofs"
-        );
-
-        let mut tampered_commitment_sk = proved_input.clone();
-        let mut tampered_commitment_sk_bundle = bundle.clone();
-        tampered_commitment_sk_bundle
-            .split_public_inputs
-            .commitment_sk = if bundle.split_public_inputs.commitment_sk
-            == transient_crypto::curve::Fr::from(1u64)
-        {
-            transient_crypto::curve::Fr::from(2u64)
-        } else {
-            transient_crypto::curve::Fr::from(1u64)
-        };
-        tampered_commitment_sk.proof =
-            std::sync::Arc::new(ZswapInputProof::Split(tampered_commitment_sk_bundle).encode());
-        assert!(
-            tampered_commitment_sk.well_formed(0).is_err(),
-            "ledger verifier must reject a split bundle whose C_sk no longer matches the attestation/client proofs"
-        );
-
-        let mut tampered_attestation = proved_input.clone();
-        let mut tampered_attestation_bundle = bundle.clone();
-        assert!(
-            !tampered_attestation_bundle.attestation_proof.0.is_empty(),
-            "synthetic v3 bundle should carry a non-empty attestation proof"
-        );
-        tampered_attestation_bundle.attestation_proof.0[0] ^= 1;
-        tampered_attestation.proof =
-            std::sync::Arc::new(ZswapInputProof::Split(tampered_attestation_bundle).encode());
-        assert!(
-            tampered_attestation.well_formed(0).is_err(),
-            "ledger verifier must reject a split bundle with a corrupted attestation proof"
+            tampered_registry_root.well_formed(0).is_err(),
+            "ledger verifier must reject a split bundle whose registry_root is not in the contract's root history"
         );
 
         let mut missing_client_proof = proved_input.clone();
@@ -697,6 +675,7 @@ mod split_spend_endpoint {
             Err(MalformedOffer::MalformedSplitProofBundle)
         ));
 
+        zswap::verify::clear_registry_root_checker();
         stop_server(server).await;
     }
 
@@ -708,6 +687,15 @@ mod split_spend_endpoint {
             );
             return;
         }
+
+        // Solution A: install a permissive registry-root checker before the
+        // proof-server starts proving anything. The preview e2e uses a
+        // synthetic single-leaf registry tree built off the wallet's
+        // freshly-generated registration — there's no deployed registry
+        // contract to consult, so admission accepts any well-formed root.
+        // Production deployments swap this for a checker that resolves
+        // the deployed registry contract from the live `LedgerState`.
+        midnight_proof_server::install_registry_root_checker_for_demo();
 
         let server = start_server(DEFAULT_NUM_WORKERS, DEFAULT_JOB_LIMIT);
         let base_url = server.base_url();
