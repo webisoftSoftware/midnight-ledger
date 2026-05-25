@@ -6,8 +6,8 @@ version.workspace = true
 publish = false
 
 [[bin]]
-name = "preview-split-prove"
-path = "src/bin/preview_split_prove.rs"
+name = "local-poc-split-prove"
+path = "src/bin/local_poc_split_prove.rs"
 
 [features]
 default = []

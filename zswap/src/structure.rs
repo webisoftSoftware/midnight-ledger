@@ -249,12 +249,11 @@ tag_enforcement_test!(Input<(), InMemoryDB>);
 pub struct SplitPublicInputs {
     /// Tag binding the client and server split proofs to the same `(coin, pk)`.
     pub coin_binding_tag: Fr,
-    /// Solution A: registry-tree historical root the per-spend membership
-    /// proof resolves to. The admission verifier checks that this root is in
-    /// the registry contract's `HistoricMerkleTree` roots set at the
-    /// transaction timestamp. The wallet's `(pk, C_sk)` are no longer
-    /// publicly disclosed — the per-spend proof opens its `reg_leaf` to a
-    /// blinded preimage under Poseidon binding.
+    /// Solution A: registry-tree root the per-spend membership proof resolves
+    /// to. The admission verifier checks this root through the host-installed
+    /// registry-root checker. The wallet's `(pk, C_sk)` are no longer publicly
+    /// disclosed; the per-spend proof opens its `reg_leaf` to a blinded
+    /// preimage under Poseidon binding.
     pub registry_root: MerkleTreeDigest,
 }
 tag_enforcement_test!(SplitPublicInputs);
@@ -266,8 +265,8 @@ pub struct SplitProofBundle {
     /// Per-spend client proof — proves nullifier ↔ coin_binding_tag ↔
     /// `registry_root` over a Merkle-membership opening of `reg_leaf`. No
     /// separate wallet-attestation proof travels with the bundle in
-    /// Solution A; registration is a one-off contract tx, not part of every
-    /// split-spend.
+    /// Solution A; first-registration evidence is generated locally for the
+    /// POC and is not part of every split-spend.
     pub client_derivation_proof: Proof,
 }
 

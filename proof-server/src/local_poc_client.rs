@@ -41,10 +41,10 @@ use zswap::ledger::State as ZswapLedgerState;
 use zswap::prove::ZswapResolver;
 use zswap::{Delta, Input, Offer as ZswapOffer, Output as ZswapOutput, split_coin_binding_tag};
 
-pub type PreviewResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+pub type LocalPocResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 const CLIENT_DERIVATION_KEY_LOCATION: &str = "split/client/sk-derivation";
-/// Solution A wallet-attestation circuit (off-chain sanity check; not
-/// submitted on-chain — the registry contract takes only `reg_leaf` bytes).
+/// Solution A wallet-attestation circuit. In the local POC this is off-chain
+/// evidence for the synthetic first-registration witness.
 const WALLET_ATTESTATION_KEY_LOCATION: &str = "split/wallet/attestation";
 /// Domain separator for the Poseidon `C_sk` commitment.
 const SK_COMMIT_SEPARATOR: &str = "midnight:sk-commit[v1]";
@@ -54,20 +54,20 @@ const REG_LEAF_SEPARATOR: &str = "midnight:wallet-reg[v1]";
 /// `split_prove::client::REGISTRY_TREE_HEIGHT` and the constant baked into
 /// `circuits/wallet_registry.compact` / `sk_proof.compact`.
 const REGISTRY_TREE_HEIGHT: u8 = 20;
-const DEFAULT_PREVIEW_TRANSFER_AMOUNT: u128 = 500 * 1_000_000;
+const DEFAULT_LOCAL_TRANSFER_AMOUNT: u128 = 500 * 1_000_000;
 
 pub fn split_nullifier(coin: &CoinInfo, sk: &coin_structure::coin::SecretKey) -> Nullifier {
     coin.nullifier(&SenderEvidence::User(Cow::Borrowed(sk)))
 }
 
-pub struct PreviewSplitProveOptions<'a> {
+pub struct LocalPocSplitProveOptions<'a> {
     pub proof_server_url: &'a str,
     pub event_limit: Option<usize>,
     pub request_timeout_secs: u64,
 }
 
 #[derive(Debug, Default, Clone)]
-pub struct PreviewSplitProveTimings {
+pub struct LocalPocSplitProveTimings {
     pub scan: Duration,
     pub derive_total: Duration,
     pub derive_local_proving: Duration,
@@ -78,7 +78,7 @@ pub struct PreviewSplitProveTimings {
     pub server_total: Option<Duration>,
 }
 
-impl PreviewSplitProveTimings {
+impl LocalPocSplitProveTimings {
     pub fn network_overhead(&self) -> Option<Duration> {
         self.server_total
             .and_then(|s| self.handoff_total.checked_sub(s))
@@ -100,7 +100,7 @@ impl PreviewSplitProveTimings {
 }
 
 #[derive(Debug)]
-pub struct PreviewSplitProveReport {
+pub struct LocalPocSplitProveReport {
     pub key_index: usize,
     pub mt_index: u64,
     pub coin_value: String,
@@ -119,10 +119,10 @@ pub struct PreviewSplitProveReport {
     pub response: serde_json::Value,
     pub submission: serde_json::Value,
     pub verification: serde_json::Value,
-    pub timings: PreviewSplitProveTimings,
+    pub timings: LocalPocSplitProveTimings,
 }
 
-pub struct PreviewWalletSpend {
+pub struct LocalPocWalletSpend {
     pub key_index: usize,
     pub key: SecretKeys,
     pub coin: CoinInfo,
@@ -132,7 +132,7 @@ pub struct PreviewWalletSpend {
     pub zswap_state: ZswapLedgerState<InMemoryDB>,
 }
 
-pub fn print_staged_report(report: &PreviewSplitProveReport) {
+pub fn print_staged_report(report: &LocalPocSplitProveReport) {
     let t = &report.timings;
     let ms = |d: Duration| d.as_millis();
     let opt_ms = |d: Option<Duration>| {
@@ -153,7 +153,7 @@ pub fn print_staged_report(report: &PreviewSplitProveReport) {
     };
 
     println!();
-    println!("=== split-prove live e2e ===");
+    println!("=== split-prove local-node e2e ===");
     println!();
     println!("--- Proof-only comparison (split-prove work) ---");
     println!(
@@ -161,7 +161,7 @@ pub fn print_staged_report(report: &PreviewSplitProveReport) {
         ms(t.derive_local_proving)
     );
     println!(
-        "  server proof:  spend-split proof (remote)           {:>6}",
+        "  server proof:  spend-split proof (proof-server)     {:>6}",
         opt_ms(t.server_split_prove)
     );
     println!(
@@ -192,7 +192,7 @@ pub fn print_staged_report(report: &PreviewSplitProveReport) {
     );
     println!("         └─ baseline wallet tx work; excluded from proof-only comparison");
     println!();
-    println!("--- SERVER (proof-server, remote) ---");
+    println!("--- SERVER (proof-server) ---");
     println!(
         "  [3/6] handoff    POST /v2/prove-split-spend              {:>6} ms total",
         handoff_ms
@@ -229,7 +229,7 @@ pub fn print_staged_report(report: &PreviewSplitProveReport) {
         ms(t.assemble_and_submit)
     );
     println!(
-        "  full demo wall-clock (scan → included tx)                {:>6} ms",
+        "  full POC wall-clock (scan → included tx)                 {:>6} ms",
         wall
     );
     println!();
@@ -245,21 +245,21 @@ pub fn print_staged_report(report: &PreviewSplitProveReport) {
     println!();
 }
 
-pub async fn prove_preview_wallet_split_spend(
-    options: PreviewSplitProveOptions<'_>,
-) -> PreviewResult<PreviewSplitProveReport> {
-    let env = preview_env();
-    let secret_keys = preview_zswap_secret_keys_scan(&env)?;
+pub async fn prove_local_wallet_split_spend(
+    options: LocalPocSplitProveOptions<'_>,
+) -> LocalPocResult<LocalPocSplitProveReport> {
+    let env = local_poc_env();
+    let secret_keys = local_zswap_secret_keys_scan(&env)?;
     let event_limit = options.event_limit.unwrap_or_else(|| {
-        env_value(&env, "MIDNIGHT_PREVIEW_ZSWAP_EVENT_LIMIT")
+        env_value(&env, "MIDNIGHT_LOCAL_ZSWAP_EVENT_LIMIT")
             .parse()
             .unwrap_or(50_000)
     });
-    let mut timings = PreviewSplitProveTimings::default();
+    let mut timings = LocalPocSplitProveTimings::default();
 
     tracing::info!(stage = "scan", role = "client", "▶ CLIENT/scan");
     let scan_start = Instant::now();
-    let wallet_spend = select_preview_wallet_spend(&secret_keys, &env, event_limit)?;
+    let wallet_spend = select_local_wallet_spend(&secret_keys, &env, event_limit)?;
     timings.scan = scan_start.elapsed();
     tracing::info!(
         stage = "scan",
@@ -268,7 +268,7 @@ pub async fn prove_preview_wallet_split_spend(
         "✓ CLIENT/scan"
     );
 
-    let transfer_value = preview_transfer_amount(&env, wallet_spend.coin.value)?;
+    let transfer_value = local_transfer_amount(&env, wallet_spend.coin.value)?;
 
     tracing::info!(stage = "derive", role = "client", "▶ CLIENT/derive");
     let derive_start = Instant::now();
@@ -311,7 +311,7 @@ pub async fn prove_preview_wallet_split_spend(
         .map(Duration::from_millis);
     timings.server_total = body["serverTotalMs"].as_u64().map(Duration::from_millis);
 
-    let recipient = decode_preview_recipient(&env)?;
+    let recipient = decode_local_recipient(&env)?;
 
     tracing::info!(
         stage = "assemble-submit",
@@ -355,7 +355,7 @@ pub async fn prove_preview_wallet_split_spend(
         "✓ independent on-chain verification"
     );
 
-    Ok(PreviewSplitProveReport {
+    Ok(LocalPocSplitProveReport {
         key_index: wallet_spend.key_index,
         mt_index: wallet_spend.mt_index,
         coin_value: wallet_spend.coin.value.to_string(),
@@ -397,7 +397,7 @@ pub async fn prove_preview_wallet_split_spend(
 fn verify_onchain_inclusion(
     env: &HashMap<String, String>,
     submission: &serde_json::Value,
-) -> PreviewResult<serde_json::Value> {
+) -> LocalPocResult<serde_json::Value> {
     let block_hash = submission["blockHash"]
         .as_str()
         .filter(|s| !s.is_empty())
@@ -409,7 +409,7 @@ fn verify_onchain_inclusion(
     let tx_id = submission["txId"].as_str().unwrap_or("");
 
     let output = Command::new("node")
-        .arg(repo_root_tool("tools/preview_verify_onchain.mjs")?)
+        .arg(repo_root_tool("tools/local_verify_onchain.mjs")?)
         .arg("--block-hash")
         .arg(block_hash)
         .arg("--inner-tx-hex")
@@ -430,17 +430,17 @@ fn verify_onchain_inclusion(
     Ok(serde_json::from_slice(&output.stdout)?)
 }
 
-fn select_preview_wallet_spend(
+fn select_local_wallet_spend(
     secret_keys: &[(usize, SecretKeys)],
     env: &HashMap<String, String>,
     event_limit: usize,
-) -> PreviewResult<PreviewWalletSpend> {
-    let preview_events = fetch_preview_zswap_events(env, event_limit)?;
+) -> LocalPocResult<LocalPocWalletSpend> {
+    let local_events = fetch_local_zswap_events(env, event_limit)?;
     let mut zswap_state = ZswapLedgerState::<InMemoryDB>::new();
     let mut spent_nullifiers = Vec::new();
     let mut owned_outputs = Vec::new();
 
-    for raw in preview_events {
+    for raw in local_events {
         let event_bytes = hex::decode(raw)?;
         let event: Event<InMemoryDB> = tagged_deserialize(&event_bytes[..])?;
 
@@ -457,7 +457,7 @@ fn select_preview_wallet_spend(
             } => {
                 if mt_index != zswap_state.first_free {
                     return Err(format!(
-                        "preview zswap replay expected mt_index {}, got {mt_index}",
+                        "local zswap replay expected mt_index {}, got {mt_index}",
                         zswap_state.first_free
                     )
                     .into());
@@ -495,9 +495,9 @@ fn select_preview_wallet_spend(
         .into_iter()
         .filter(|(_, _, _, _, nullifier, _)| !spent_nullifiers.contains(nullifier))
         .max_by_key(|(_, _, coin, _, _, _)| coin.value)
-        .ok_or("preview wallet has no unspent shielded outputs in scanned events")?;
+        .ok_or("local wallet has no unspent shielded outputs in scanned events")?;
 
-    Ok(PreviewWalletSpend {
+    Ok(LocalPocWalletSpend {
         key_index,
         key,
         coin,
@@ -509,22 +509,22 @@ fn select_preview_wallet_spend(
 }
 
 pub async fn build_split_spend_handoff(
-    spend: &PreviewWalletSpend,
-) -> PreviewResult<serde_json::Value> {
+    spend: &LocalPocWalletSpend,
+) -> LocalPocResult<serde_json::Value> {
     let (value, _) = build_split_spend_handoff_timed(spend).await?;
     Ok(value)
 }
 
 pub async fn build_split_spend_handoff_timed(
-    spend: &PreviewWalletSpend,
-) -> PreviewResult<(serde_json::Value, Duration)> {
+    spend: &LocalPocWalletSpend,
+) -> LocalPocResult<(serde_json::Value, Duration)> {
     let mut zswap_state_bytes = Vec::new();
     tagged_serialize(&spend.zswap_state, &mut zswap_state_bytes)?;
     let pk = spend.key.coin_secret_key.public_key();
     let coin_binding_tag = split_coin_binding_tag(&spend.coin, pk);
 
     // Solution A wallet registration. In a real wallet this is generated once
-    // at setup, persisted, and reused across every spend; the preview e2e
+    // at setup, persisted, and reused across every spend; the local POC
     // generates it fresh per run so the demo is self-contained. The
     // attestation proof itself is *not* submitted on-chain — the
     // contract-side `register(reg_leaf)` call accepts the leaf bytes and the
@@ -534,17 +534,21 @@ pub async fn build_split_spend_handoff_timed(
     let registration = prove_wallet_attestation(&spend.key.coin_secret_key).await?;
     let attestation_elapsed = attestation_start.elapsed();
 
-    // Build a single-leaf registry tree mirroring the registry contract's
-    // state after this wallet's `register(reg_leaf)` call. For now the
-    // preview e2e uses this synthetic in-memory tree; once the contract is
-    // deployed we'll read the live tree state instead (Phase 10 wires
-    // `install_registry_root_checker` against the same tree state).
+    // Build a single-leaf registry tree mirroring the state after this wallet's
+    // synthetic first registration. For now the
+    // local POC uses this synthetic in-memory tree and a permissive
+    // registry-root checker in the local proof-server/node/indexer.
     let registry_witness = build_first_registration_witness(&registration)?;
 
     let proving_start = Instant::now();
-    let client_derivation_proof =
-        prove_client_derivation(spend, coin_binding_tag, pk, &registration, &registry_witness)
-            .await?;
+    let client_derivation_proof = prove_client_derivation(
+        spend,
+        coin_binding_tag,
+        pk,
+        &registration,
+        &registry_witness,
+    )
+    .await?;
     let client_derivation_elapsed = proving_start.elapsed();
 
     // The user-facing `derive_local_proving` timing counts only the per-spend
@@ -558,8 +562,7 @@ pub async fn build_split_spend_handoff_timed(
         "✓ CLIENT/wallet-attestation (one-time)"
     );
 
-    let registry_root_hex =
-        hex::encode(registry_witness.registry_root.0.as_le_bytes());
+    let registry_root_hex = hex::encode(registry_witness.registry_root.0.as_le_bytes());
 
     Ok((
         json!({
@@ -589,7 +592,7 @@ async fn post_split_spend_handoff(
     proof_server_url: &str,
     handoff: serde_json::Value,
     request_timeout_secs: u64,
-) -> PreviewResult<serde_json::Value> {
+) -> LocalPocResult<serde_json::Value> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(request_timeout_secs))
         .build()?;
@@ -606,18 +609,18 @@ async fn post_split_spend_handoff(
     Ok(body)
 }
 
-struct PreviewRecipient {
+struct LocalPocRecipient {
     address: String,
     coin_public_key: CoinPublicKey,
     encryption_public_key: encryption::PublicKey,
 }
 
-fn decode_preview_recipient(env: &HashMap<String, String>) -> PreviewResult<PreviewRecipient> {
-    let address = env_value(env, "MIDNIGHT_PREVIEW_RECIPIENT_SHIELDED_ADDRESS");
+fn decode_local_recipient(env: &HashMap<String, String>) -> LocalPocResult<LocalPocRecipient> {
+    let address = env_value(env, "MIDNIGHT_LOCAL_RECIPIENT_SHIELDED_ADDRESS");
     if address.trim().is_empty() {
-        return Err("set MIDNIGHT_PREVIEW_RECIPIENT_SHIELDED_ADDRESS for split-send e2e".into());
+        return Err("set MIDNIGHT_LOCAL_RECIPIENT_SHIELDED_ADDRESS for split-send e2e".into());
     }
-    let network_id = env_value_or(env, "MIDNIGHT_PREVIEW_NETWORK_ID", "preview");
+    let network_id = env_value_or(env, "MIDNIGHT_LOCAL_NETWORK_ID", "undeployed");
     let output = Command::new("node")
         .arg(repo_root_tool(
             "tools/decode_midnight_shielded_address.mjs",
@@ -649,7 +652,7 @@ fn decode_preview_recipient(env: &HashMap<String, String>) -> PreviewResult<Prev
             .ok_or("decoded recipient missing encryptionPublicKey")?,
     )?;
 
-    Ok(PreviewRecipient {
+    Ok(LocalPocRecipient {
         address: address.trim().to_string(),
         coin_public_key,
         encryption_public_key,
@@ -659,18 +662,16 @@ fn decode_preview_recipient(env: &HashMap<String, String>) -> PreviewResult<Prev
 async fn submit_split_send_transaction(
     env: &HashMap<String, String>,
     proof_server_url: &str,
-    spend: &PreviewWalletSpend,
+    spend: &LocalPocWalletSpend,
     split_response: &serde_json::Value,
-    recipient: &PreviewRecipient,
+    recipient: &LocalPocRecipient,
     transfer_value: u128,
-) -> PreviewResult<serde_json::Value> {
-    if env_value(env, "MIDNIGHT_PREVIEW_RECOVERY_PHRASE")
+) -> LocalPocResult<serde_json::Value> {
+    if env_value(env, "MIDNIGHT_LOCAL_RECOVERY_PHRASE")
         .trim()
         .is_empty()
     {
-        return Err(
-            "set MIDNIGHT_PREVIEW_RECOVERY_PHRASE for full split-send e2e submission".into(),
-        );
+        return Err("set MIDNIGHT_LOCAL_RECOVERY_PHRASE for full split-send e2e submission".into());
     }
 
     let input_preimage_hex = split_response["inputPreimageHex"]
@@ -749,7 +750,7 @@ async fn submit_split_send_transaction(
         PedersenRandomness,
         InMemoryDB,
     > = Transaction::Standard(StandardTransaction {
-        network_id: env_value_or(env, "MIDNIGHT_PREVIEW_NETWORK_ID", "preview"),
+        network_id: env_value_or(env, "MIDNIGHT_LOCAL_NETWORK_ID", "undeployed"),
         intents: StorageHashMap::new(),
         guaranteed_coins: Some(Sp::new(proven_offer)),
         fallible_coins: StorageHashMap::new(),
@@ -766,7 +767,7 @@ async fn submit_split_send_transaction(
     let tx_hex = hex::encode(tx_bytes);
 
     let output = Command::new("node")
-        .arg(repo_root_tool("tools/preview_balance_submit_split_tx.mjs")?)
+        .arg(repo_root_tool("tools/local_balance_submit_split_tx.mjs")?)
         .arg("--tx-hex")
         .arg(tx_hex)
         .arg("--key-index")
@@ -788,22 +789,22 @@ async fn submit_split_send_transaction(
     Ok(serde_json::from_slice(&output.stdout)?)
 }
 
-fn preview_transfer_amount(env: &HashMap<String, String>, coin_value: u128) -> PreviewResult<u128> {
-    let raw = env_value(env, "MIDNIGHT_PREVIEW_TRANSFER_AMOUNT");
+fn local_transfer_amount(env: &HashMap<String, String>, coin_value: u128) -> LocalPocResult<u128> {
+    let raw = env_value(env, "MIDNIGHT_LOCAL_TRANSFER_AMOUNT");
     let transfer_value = if raw.trim().is_empty() {
-        DEFAULT_PREVIEW_TRANSFER_AMOUNT
+        DEFAULT_LOCAL_TRANSFER_AMOUNT
     } else {
         raw.trim().parse::<u128>().map_err(|e| {
-            format!("MIDNIGHT_PREVIEW_TRANSFER_AMOUNT must be a positive integer: {e}")
+            format!("MIDNIGHT_LOCAL_TRANSFER_AMOUNT must be a positive integer: {e}")
         })?
     };
 
     if transfer_value == 0 {
-        return Err("MIDNIGHT_PREVIEW_TRANSFER_AMOUNT must be greater than zero".into());
+        return Err("MIDNIGHT_LOCAL_TRANSFER_AMOUNT must be greater than zero".into());
     }
     if transfer_value > coin_value {
         return Err(format!(
-            "MIDNIGHT_PREVIEW_TRANSFER_AMOUNT ({transfer_value}) exceeds selected shielded coin value ({coin_value})"
+            "MIDNIGHT_LOCAL_TRANSFER_AMOUNT ({transfer_value}) exceeds selected shielded coin value ({coin_value})"
         )
         .into());
     }
@@ -813,7 +814,7 @@ fn preview_transfer_amount(env: &HashMap<String, String>, coin_value: u128) -> P
 
 async fn prove_zswap_output(
     output: &ZswapOutput<ProofPreimage, InMemoryDB>,
-) -> PreviewResult<ZswapOutput<Proof, InMemoryDB>> {
+) -> LocalPocResult<ZswapOutput<Proof, InMemoryDB>> {
     let resolver = ZswapResolver(
         MidnightDataProvider::new(
             FetchMode::OnDemand,
@@ -833,20 +834,23 @@ async fn prove_zswap_output(
         .map_err(|e| format!("zswap recipient output proof failed: {e}").into())
 }
 
-fn deserialize_tagged_hex<T: Deserializable + Tagged>(value: &str) -> PreviewResult<T> {
+fn deserialize_tagged_hex<T: Deserializable + Tagged>(value: &str) -> LocalPocResult<T> {
     let bytes = hex::decode(value.trim().trim_start_matches("0x"))?;
     Ok(tagged_deserialize(&bytes[..])?)
 }
 
-fn deserialize_hex<T: Deserializable>(value: &str) -> PreviewResult<T> {
+fn deserialize_hex<T: Deserializable>(value: &str) -> LocalPocResult<T> {
     let bytes = hex::decode(value.trim().trim_start_matches("0x"))?;
     Ok(T::deserialize(&mut &bytes[..], 0)?)
 }
 
-pub fn preview_env() -> HashMap<String, String> {
+pub fn local_poc_env() -> HashMap<String, String> {
     let mut values = HashMap::new();
     for (key, value) in std::env::vars() {
-        if key.starts_with("MIDNIGHT_PREVIEW_") {
+        if key.starts_with("MIDNIGHT_LOCAL_")
+            || key.starts_with("MIDNIGHT_PREVIEW_")
+            || key.starts_with("MIDNIGHT_PROOF_SERVER_")
+        {
             values.insert(key, value);
         }
     }
@@ -861,7 +865,13 @@ pub fn preview_env() -> HashMap<String, String> {
 }
 
 fn env_value(env: &HashMap<String, String>, key: &str) -> String {
-    env.get(key).cloned().unwrap_or_default()
+    env.get(key)
+        .cloned()
+        .or_else(|| {
+            key.strip_prefix("MIDNIGHT_LOCAL_")
+                .and_then(|suffix| env.get(&format!("MIDNIGHT_PREVIEW_{suffix}")).cloned())
+        })
+        .unwrap_or_default()
 }
 
 fn env_value_or(env: &HashMap<String, String>, key: &str, default: &str) -> String {
@@ -873,13 +883,13 @@ fn env_value_or(env: &HashMap<String, String>, key: &str, default: &str) -> Stri
     }
 }
 
-fn fetch_preview_zswap_events(
+fn fetch_local_zswap_events(
     env: &HashMap<String, String>,
     limit: usize,
-) -> PreviewResult<Vec<String>> {
-    let endpoint = env_value(env, "MIDNIGHT_PREVIEW_INDEXER_WS");
+) -> LocalPocResult<Vec<String>> {
+    let endpoint = env_value(env, "MIDNIGHT_LOCAL_INDEXER_WS");
     let endpoint = if endpoint.trim().is_empty() {
-        "wss://indexer.preview.midnight.network/api/v4/graphql/ws".to_string()
+        "ws://127.0.0.1:8088/api/v4/graphql/ws".to_string()
     } else {
         endpoint
     };
@@ -900,7 +910,7 @@ const finish = () => {{
   try {{ ws.close(); }} catch {{}}
   setTimeout(() => process.exit(0), 20);
 }};
-const timer = setTimeout(() => fail('timed out waiting for preview zswap events'), 20000);
+const timer = setTimeout(() => fail('timed out waiting for local zswap events'), 20000);
 ws.addEventListener('open', () => {{
   ws.send(JSON.stringify({{ type: 'connection_init' }}));
 }});
@@ -908,7 +918,7 @@ ws.addEventListener('message', (event) => {{
   const msg = JSON.parse(String(event.data));
   if (msg.type === 'connection_ack') {{
     ws.send(JSON.stringify({{
-      id: 'preview-zswap-events',
+      id: 'local-zswap-events',
       type: 'subscribe',
       payload: {{
         query: 'subscription ($id: Int) {{ zswapLedgerEvents(id: $id) {{ id maxId raw }} }}',
@@ -936,7 +946,7 @@ ws.addEventListener('error', (event) => {{
     let output = Command::new("node").arg("-e").arg(script).output()?;
     if !output.status.success() {
         return Err(format!(
-            "preview indexer fetch failed: {}",
+            "local indexer fetch failed: {}",
             String::from_utf8_lossy(&output.stderr)
         )
         .into());
@@ -945,24 +955,24 @@ ws.addEventListener('error', (event) => {{
     Ok(serde_json::from_slice(&output.stdout)?)
 }
 
-fn preview_zswap_secret_keys_scan(
+fn local_zswap_secret_keys_scan(
     env: &HashMap<String, String>,
-) -> PreviewResult<Vec<(usize, SecretKeys)>> {
-    let scan_limit = env_value(env, "MIDNIGHT_PREVIEW_ZSWAP_KEY_SCAN_LIMIT")
+) -> LocalPocResult<Vec<(usize, SecretKeys)>> {
+    let scan_limit = env_value(env, "MIDNIGHT_LOCAL_ZSWAP_KEY_SCAN_LIMIT")
         .parse()
         .unwrap_or(1);
     (0..scan_limit)
-        .map(|index| preview_zswap_secret_keys(env, index).map(|key| (index, key)))
+        .map(|index| local_zswap_secret_keys(env, index).map(|key| (index, key)))
         .collect()
 }
 
-fn preview_zswap_secret_keys(
+fn local_zswap_secret_keys(
     env: &HashMap<String, String>,
     index: usize,
-) -> PreviewResult<SecretKeys> {
-    let seed_hex = env_value(env, "MIDNIGHT_PREVIEW_ZSWAP_SEED_HEX");
+) -> LocalPocResult<SecretKeys> {
+    let seed_hex = env_value(env, "MIDNIGHT_LOCAL_ZSWAP_SEED_HEX");
     let seed_hex = if seed_hex.trim().is_empty() {
-        derive_preview_zswap_seed_hex(env, index)?
+        derive_local_zswap_seed_hex(env, index)?
     } else {
         seed_hex
     };
@@ -974,12 +984,12 @@ fn preview_zswap_secret_keys(
 }
 
 async fn prove_client_derivation(
-    spend: &PreviewWalletSpend,
+    spend: &LocalPocWalletSpend,
     coin_binding_tag: Fr,
     pk: CoinPublicKey,
-    registration: &PreviewWalletRegistration,
-    witness: &PreviewRegistryWitness,
-) -> PreviewResult<transient_crypto::proofs::Proof> {
+    registration: &LocalPocWalletRegistration,
+    witness: &LocalPocRegistryWitness,
+) -> LocalPocResult<transient_crypto::proofs::Proof> {
     let preimage =
         build_client_derivation_preimage(spend, coin_binding_tag, pk, registration, witness);
     let resolver = ClientDerivationResolver::new(ZswapResolver(
@@ -998,11 +1008,11 @@ async fn prove_client_derivation(
 }
 
 fn build_client_derivation_preimage(
-    spend: &PreviewWalletSpend,
+    spend: &LocalPocWalletSpend,
     coin_binding_tag: Fr,
     pk: CoinPublicKey,
-    registration: &PreviewWalletRegistration,
-    witness: &PreviewRegistryWitness,
+    registration: &LocalPocWalletRegistration,
+    witness: &LocalPocRegistryWitness,
 ) -> ProofPreimage {
     // Solution A witness layout matches `circuits/sk_proof.compact` parameter
     // declaration order: (sk, pk, r, salt, coin, merkle_path).
@@ -1056,12 +1066,11 @@ fn client_derivation_public_transcript_inputs(
     inputs
 }
 
-/// Solution A wallet registration produced once per preview run. The bytes
-/// are submitted to the registry contract; the Fr is the in-circuit
-/// `regLeaf` value; the proof is off-chain evidence (not part of any
-/// split bundle).
+/// Solution A wallet registration produced once per local POC run. The Fr is
+/// the in-circuit `regLeaf` value; the proof is off-chain evidence and is not
+/// part of any split bundle.
 #[derive(Debug, Clone)]
-pub(crate) struct PreviewWalletRegistration {
+pub(crate) struct LocalPocWalletRegistration {
     pub blinding: Fr,
     pub salt: Fr,
     /// In-circuit `regLeaf` Field. Kept for diagnostics — the upgrade
@@ -1075,17 +1084,17 @@ pub(crate) struct PreviewWalletRegistration {
     pub attestation_proof: Proof,
 }
 
-/// Single-leaf registry witness mirroring the registry contract's state
-/// after this wallet's first `register` call resolves.
+/// Single-leaf registry witness mirroring the synthetic first-registration
+/// state for this wallet.
 #[derive(Debug, Clone)]
-pub(crate) struct PreviewRegistryWitness {
+pub(crate) struct LocalPocRegistryWitness {
     pub merkle_path: MerklePath<((), HashOutput)>,
     pub registry_root: MerkleTreeDigest,
 }
 
 fn build_first_registration_witness(
-    registration: &PreviewWalletRegistration,
-) -> PreviewResult<PreviewRegistryWitness> {
+    registration: &LocalPocWalletRegistration,
+) -> LocalPocResult<LocalPocRegistryWitness> {
     let leaf_hash = HashOutput(registration.reg_leaf_bytes);
     let mt = MerkleTree::<(), InMemoryDB>::blank(REGISTRY_TREE_HEIGHT)
         .update_hash(0, leaf_hash, ())
@@ -1104,7 +1113,7 @@ fn build_first_registration_witness(
             }
         },
     ));
-    Ok(PreviewRegistryWitness {
+    Ok(LocalPocRegistryWitness {
         merkle_path,
         registry_root,
     })
@@ -1163,7 +1172,7 @@ fn wallet_attestation_public_transcript_inputs(reg_leaf_fr: Fr) -> Vec<Fr> {
 /// reuses the result on every spend in that run.
 pub(crate) async fn prove_wallet_attestation(
     sk: &coin_structure::coin::SecretKey,
-) -> PreviewResult<PreviewWalletRegistration> {
+) -> LocalPocResult<LocalPocWalletRegistration> {
     let r: Fr = OsRng.r#gen();
     let salt: Fr = OsRng.r#gen();
     let (_c_sk_fr, reg_leaf_fr) = derive_reg_leaf(sk, r, salt);
@@ -1182,7 +1191,7 @@ pub(crate) async fn prove_wallet_attestation(
         .prove::<zkir::IrSource>(OsRng, &resolver, &resolver)
         .await
         .map_err(|e| format!("wallet attestation proof failed: {e}"))?;
-    Ok(PreviewWalletRegistration {
+    Ok(LocalPocWalletRegistration {
         blinding: r,
         salt,
         reg_leaf_fr,
@@ -1267,26 +1276,25 @@ fn wallet_attestation_proving_data() -> ProvingKeyMaterial {
     }
 }
 
-fn derive_preview_zswap_seed_hex(
+fn derive_local_zswap_seed_hex(
     env: &HashMap<String, String>,
     index: usize,
-) -> PreviewResult<String> {
-    let phrase = env_value(env, "MIDNIGHT_PREVIEW_RECOVERY_PHRASE");
+) -> LocalPocResult<String> {
+    let phrase = env_value(env, "MIDNIGHT_LOCAL_RECOVERY_PHRASE");
     if phrase.trim().is_empty() {
         return Err(
-            "set MIDNIGHT_PREVIEW_RECOVERY_PHRASE or MIDNIGHT_PREVIEW_ZSWAP_SEED_HEX in .env"
-                .into(),
+            "set MIDNIGHT_LOCAL_RECOVERY_PHRASE or MIDNIGHT_LOCAL_ZSWAP_SEED_HEX in .env".into(),
         );
     }
 
     let output = Command::new("node")
         .arg(repo_root_tool("tools/derive_midnight_zswap_seed.mjs")?)
-        .env("MIDNIGHT_PREVIEW_RECOVERY_PHRASE", phrase)
+        .env("MIDNIGHT_LOCAL_RECOVERY_PHRASE", phrase)
         .env(
-            "MIDNIGHT_PREVIEW_ACCOUNT",
-            env_value(env, "MIDNIGHT_PREVIEW_ACCOUNT"),
+            "MIDNIGHT_LOCAL_ACCOUNT",
+            env_value(env, "MIDNIGHT_LOCAL_ACCOUNT"),
         )
-        .env("MIDNIGHT_PREVIEW_ZSWAP_KEY_INDEX", index.to_string())
+        .env("MIDNIGHT_LOCAL_ZSWAP_KEY_INDEX", index.to_string())
         .output()?;
 
     if !output.status.success() {
@@ -1300,7 +1308,7 @@ fn derive_preview_zswap_seed_hex(
     Ok(String::from_utf8(output.stdout)?.trim().to_string())
 }
 
-fn repo_root_tool(relative_path: &str) -> PreviewResult<PathBuf> {
+fn repo_root_tool(relative_path: &str) -> LocalPocResult<PathBuf> {
     let mut dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     loop {
         let candidate = dir.join(relative_path);

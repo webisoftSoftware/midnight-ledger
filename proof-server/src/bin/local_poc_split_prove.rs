@@ -4,10 +4,11 @@
 
 use actix_web::rt;
 use clap::Parser;
-use midnight_proof_server::preview_client::{
-    PreviewSplitProveOptions, print_staged_report, prove_preview_wallet_split_spend,
+use midnight_proof_server::local_poc_client::{
+    LocalPocSplitProveOptions, print_staged_report, prove_local_wallet_split_spend,
 };
 use midnight_proof_server::{server, worker_pool::WorkerPool};
+use std::env;
 use tracing::{Level, info};
 use tracing_subscriber::filter::Targets;
 use tracing_subscriber::layer::SubscriberExt;
@@ -28,12 +29,12 @@ struct Args {
         env = "MIDNIGHT_PROOF_SERVER_JOB_TIMEOUT"
     )]
     job_timeout: f64,
-    #[arg(long, env = "MIDNIGHT_PREVIEW_ZSWAP_EVENT_LIMIT")]
+    #[arg(long, env = "MIDNIGHT_LOCAL_ZSWAP_EVENT_LIMIT")]
     event_limit: Option<usize>,
     #[arg(
         long,
         default_value_t = 120,
-        env = "MIDNIGHT_PREVIEW_REQUEST_TIMEOUT_SECS"
+        env = "MIDNIGHT_LOCAL_REQUEST_TIMEOUT_SECS"
     )]
     request_timeout_secs: u64,
     #[arg(short, long, env = "MIDNIGHT_PROOF_SERVER_VERBOSE")]
@@ -57,10 +58,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         (url, Some(handle))
     };
 
-    let result = prove_preview_wallet_split_spend(PreviewSplitProveOptions {
+    let event_limit = args
+        .event_limit
+        .or_else(|| env_usize("MIDNIGHT_PREVIEW_ZSWAP_EVENT_LIMIT"));
+    let request_timeout_secs = if env::var("MIDNIGHT_LOCAL_REQUEST_TIMEOUT_SECS").is_ok() {
+        args.request_timeout_secs
+    } else {
+        env_u64("MIDNIGHT_PREVIEW_REQUEST_TIMEOUT_SECS").unwrap_or(args.request_timeout_secs)
+    };
+
+    let result = prove_local_wallet_split_spend(LocalPocSplitProveOptions {
         proof_server_url: &proof_server_url,
-        event_limit: args.event_limit,
-        request_timeout_secs: args.request_timeout_secs,
+        event_limit,
+        request_timeout_secs,
     })
     .await;
 
@@ -70,7 +80,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let report = result?;
     println!(
-        "split-sent preview output key_index={} mt_index={} input_value={} transfer_value={} change_value={} token={} recipient={} status={} proof_len={} tx_hash={} tx_id={} tx_len={}",
+        "split-sent local output key_index={} mt_index={} input_value={} transfer_value={} change_value={} token={} recipient={} status={} proof_len={} tx_hash={} tx_id={} tx_len={}",
         report.key_index,
         report.mt_index,
         report.coin_value,
@@ -86,6 +96,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     );
     print_staged_report(&report);
     Ok(())
+}
+
+fn env_usize(key: &str) -> Option<usize> {
+    env::var(key).ok().and_then(|value| value.parse().ok())
+}
+
+fn env_u64(key: &str) -> Option<u64> {
+    env::var(key).ok().and_then(|value| value.parse().ok())
 }
 
 fn init_logging(verbose: bool) {

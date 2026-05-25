@@ -27,65 +27,18 @@ use crate::endpoints::{
 use crate::worker_pool::WorkerPool;
 
 pub mod endpoints;
-pub mod preview_client;
+pub mod local_poc_client;
 pub mod versioned_ir;
 pub mod worker_pool;
 
-/// Solution A: install a registry-root checker into Zswap's admission path.
+/// Install a permissive registry-root checker for the local-node POC.
 ///
-/// **Demo mode** — installs a permissive checker that accepts any root.
-/// Used by the live preview e2e where the synthetic single-leaf registry
-/// tree the wallet builds in-memory (`PreviewRegistryWitness::
-/// for_first_registration`) has no corresponding deployed contract whose
-/// history can be consulted.
-///
-/// Production deployments call `install_registry_root_checker_from_ledger`
-/// instead, which:
-///   1. reads the registry contract address from
-///      `circuits/static/wallet-registry/contract_address.txt` (or
-///      `WALLET_REGISTRY_CONTRACT_ADDRESS` env),
-///   2. resolves the deployed contract from a live `LedgerState`,
-///   3. extracts every `MerkleTreeDigest` from its `ChargedState` via
-///      `ledger::verify::wallet_registry_root_check`, and
-///   4. installs a closure that returns `true` iff `root` is in that set.
-pub fn install_registry_root_checker_for_demo() {
+/// Zswap admission fails closed when no checker is installed. The local POC
+/// uses a synthetic client-side registry witness rather than deployed registry
+/// state, so the proof-server accepts any well-formed root.
+pub fn install_local_registry_root_checker() {
     zswap::verify::install_registry_root_checker(Box::new(|_root| true));
-    tracing::warn!(
-        "Solution A: demo-mode registry-root checker installed (accepts all roots). \
-         Wire a real checker against the deployed registry contract for production."
-    );
-}
-
-/// Production wiring of `install_registry_root_checker` — extracts the
-/// admissible-root set from the live ledger state at boot and installs a
-/// closure that admits only those roots.
-///
-/// This is the bridge between the `StateReference::wallet_registry_root_check`
-/// abstraction in the ledger crate and Zswap's process-wide `RegistryRootChecker`.
-/// Call once at startup, after the proof-server has fetched the latest
-/// `LedgerState` from the indexer; re-call when the contract's state moves
-/// (the closure captures a snapshot, so it must be reinstalled as the tree
-/// grows).
-pub fn install_registry_root_checker_from_ledger<D: storage::db::DB>(
-    state: &ledger::structure::LedgerState<D>,
-) -> Result<usize, &'static str> {
-    let address = ledger::verify::wallet_registry_contract_address()
-        .ok_or("registry contract address not configured (set WALLET_REGISTRY_CONTRACT_ADDRESS \
-                or place a deployed address in circuits/static/wallet-registry/contract_address.txt)")?;
-    let contract = state
-        .index(address)
-        .ok_or("registry contract not present in the supplied LedgerState")?;
-    let roots = ledger::verify::extract_historic_roots_for(contract.data.get_ref());
-    let count = roots.len();
-    let admissible: std::collections::BTreeSet<_> = roots.into_iter().collect();
-    zswap::verify::install_registry_root_checker(Box::new(move |root| {
-        admissible.contains(&root)
-    }));
-    tracing::info!(
-        "Solution A: installed registry-root checker with {} admissible roots from contract {:?}",
-        count, address
-    );
-    Ok(count)
+    tracing::warn!("Solution A: local POC registry-root checker installed (accepts all roots)");
 }
 
 pub fn server(port: u16, fetch_params: bool, pool: WorkerPool) -> std::io::Result<(Server, u16)> {

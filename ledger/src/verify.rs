@@ -55,119 +55,6 @@ use transient_crypto::merkle_tree::MerkleTreeDigest;
 use transient_crypto::repr::FieldRepr;
 use zswap::Transient;
 
-/// Lazy lookup of the deployed wallet-registry contract address. Reads
-/// `WALLET_REGISTRY_CONTRACT_ADDRESS` from the environment if set, otherwise
-/// loads the address written by `tools/deploy_registry.sh` to
-/// `circuits/static/wallet-registry/contract_address.txt` relative to the
-/// current working directory or one of its parents.
-///
-/// Returns `None` if neither source is available — admission then treats
-/// the registry as "empty" (no historical roots) and rejects all split
-/// spends, which matches the Solution A fail-closed posture.
-pub fn wallet_registry_contract_address() -> Option<ContractAddress> {
-    use std::sync::OnceLock;
-    static CACHED: OnceLock<Option<ContractAddress>> = OnceLock::new();
-    CACHED
-        .get_or_init(|| {
-            let address_hex = std::env::var("WALLET_REGISTRY_CONTRACT_ADDRESS")
-                .ok()
-                .or_else(|| {
-                    // Search the current dir and a few parent dirs for the
-                    // file the deploy script writes.
-                    let mut dir = std::env::current_dir().ok()?;
-                    for _ in 0..6 {
-                        let candidate = dir.join(
-                            "circuits/static/wallet-registry/contract_address.txt",
-                        );
-                        if let Ok(contents) = std::fs::read_to_string(&candidate) {
-                            return Some(contents);
-                        }
-                        if !dir.pop() {
-                            break;
-                        }
-                    }
-                    None
-                })?;
-            let hex = address_hex
-                .trim()
-                .trim_start_matches("0x")
-                .trim_start_matches("0X");
-            if hex.len() != 64 {
-                return None;
-            }
-            let mut bytes = [0u8; 32];
-            for (i, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
-                let s = std::str::from_utf8(chunk).ok()?;
-                bytes[i] = u8::from_str_radix(s, 16).ok()?;
-            }
-            Some(ContractAddress(HashOutput(bytes)))
-        })
-        .clone()
-}
-
-/// Walk a contract's `StateValue` and collect every `MerkleTreeDigest` that
-/// appears as either (a) the root of a `BoundedMerkleTree`, or (b) a key in
-/// a `Map` whose key alignment is a single `Field`.
-///
-/// For Solution A this returns the union of the registry contract's current
-/// tree root and its `HistoricMerkleTree`'s root-history map keys. Both
-/// shapes are accepted to stay forward-compatible with Compact's lowering
-/// of `HistoricMerkleTree<H, T>` — we don't depend on a specific internal
-/// layout, only on the invariant that historical roots appear somewhere in
-/// the contract's StateValue.
-///
-/// Public façade for use by host crates (e.g. the proof-server's
-/// `install_registry_root_checker_from_ledger`).
-pub fn extract_historic_roots_for<D: DB>(
-    state: &onchain_runtime::state::StateValue<D>,
-) -> std::collections::BTreeSet<MerkleTreeDigest> {
-    extract_historic_roots(state)
-}
-
-fn extract_historic_roots<D: DB>(
-    state: &onchain_runtime::state::StateValue<D>,
-) -> std::collections::BTreeSet<MerkleTreeDigest> {
-    use onchain_runtime::state::StateValue;
-    let mut roots = std::collections::BTreeSet::new();
-    let mut frontier: Vec<onchain_runtime::state::StateValue<D>> = vec![state.clone()];
-    while let Some(node) = frontier.pop() {
-        match &node {
-            StateValue::Null => {}
-            StateValue::Cell(_) => {
-                // Cells in HistoricMerkleTree state mostly hold structural
-                // counters (e.g. first_free index) — not roots. Roots show
-                // up as Map keys and BoundedMerkleTree roots, both of
-                // which we cover.
-            }
-            StateValue::Map(m) => {
-                for kv in m.iter() {
-                    let (k, v) = &*kv;
-                    // Try parsing the key as a single Field — if so, treat
-                    // it as a candidate root in the history map.
-                    let value_slice: &base_crypto::fab::ValueSlice = &k.value;
-                    if let Ok(digest) = MerkleTreeDigest::try_from(value_slice) {
-                        roots.insert(digest);
-                    }
-                    frontier.push((**v).clone());
-                }
-            }
-            StateValue::Array(arr) => {
-                for elem in arr.iter() {
-                    frontier.push((*elem).clone());
-                }
-            }
-            StateValue::BoundedMerkleTree(mt) => {
-                if let Some(root) = mt.root() {
-                    roots.insert(root);
-                }
-            }
-            // `StateValue` is `#[non_exhaustive]`; ignore future variants.
-            _ => {}
-        }
-    }
-    roots
-}
-
 pub trait ContractStateExt<D: DB> {
     #[allow(clippy::result_large_err)]
     fn well_formed(&self, address: ContractAddress) -> Result<(), MalformedTransaction<D>>;
@@ -209,23 +96,6 @@ pub trait StateReference<D: DB> {
             MerkleTreeDigest,
             MerkleTreeDigest,
         ) -> Result<(), MalformedTransaction<D>>,
-    ) -> Result<(), MalformedTransaction<D>>;
-    /// Solution A: expose the wallet-registry contract's historical-roots
-    /// set to the caller. The closure receives a `contains` predicate keyed
-    /// on `MerkleTreeDigest`; the implementation is responsible for resolving
-    /// the registry contract from configuration and pulling its
-    /// `HistoricMerkleTree<20>` root history.
-    ///
-    /// This is the trait-level surface the plan calls for. The concrete
-    /// wiring into Zswap's `Input::well_formed` is currently done via the
-    /// process-wide `zswap::install_registry_root_checker` setter (see
-    /// `deps/midnight-ledger/zswap/src/verify.rs`) — `wallet_registry_root_check`
-    /// is the StateReference-side entry the host calls at startup to install
-    /// that checker.
-    fn wallet_registry_root_check(
-        &self,
-        ctime: Timestamp,
-        check: impl FnOnce(&dyn Fn(MerkleTreeDigest) -> bool) -> Result<(), MalformedTransaction<D>>,
     ) -> Result<(), MalformedTransaction<D>>;
     fn network_check(&self, network: &str) -> Result<(), MalformedTransaction<D>>;
     fn ref_state_hash(&self) -> ArenaHash<D::Hasher>;
@@ -322,30 +192,6 @@ impl<D: DB> StateReference<D> for LedgerState<D> {
             .map(|x| x.0)
             .unwrap_or_default();
         check(params, commitment_root, generation_root)
-    }
-    fn wallet_registry_root_check(
-        &self,
-        _ctime: Timestamp,
-        check: impl FnOnce(&dyn Fn(MerkleTreeDigest) -> bool) -> Result<(), MalformedTransaction<D>>,
-    ) -> Result<(), MalformedTransaction<D>> {
-        // Solution A: resolve the deployed registry contract from the live
-        // `LedgerState`, walk its `ChargedState` to collect every
-        // `MerkleTreeDigest` that appears (current tree roots + historical
-        // roots map keys), and expose membership via a closure.
-        //
-        // Address resolution: at boot the host writes the deployed contract
-        // address to `circuits/static/wallet-registry/contract_address.txt`
-        // (see `tools/deploy_registry.sh`). `wallet_registry_contract_address()`
-        // reads this file lazily.
-        let admissible: std::collections::BTreeSet<MerkleTreeDigest> =
-            match wallet_registry_contract_address() {
-                Some(addr) => self
-                    .index(addr)
-                    .map(|contract| extract_historic_roots(contract.data.get_ref()))
-                    .unwrap_or_default(),
-                None => Default::default(),
-            };
-        check(&|root: MerkleTreeDigest| admissible.contains(&root))
     }
     fn network_check(&self, network: &str) -> Result<(), MalformedTransaction<D>> {
         if self.network_id == network {
@@ -486,16 +332,6 @@ impl<D: DB> StateReference<D> for RevalidationReference<D> {
         } else {
             check(params_new, commitment_root_new, generation_root_new)
         }
-    }
-    fn wallet_registry_root_check(
-        &self,
-        ctime: Timestamp,
-        check: impl FnOnce(&dyn Fn(MerkleTreeDigest) -> bool) -> Result<(), MalformedTransaction<D>>,
-    ) -> Result<(), MalformedTransaction<D>> {
-        // Defer to the live state's checker — root history only ever grows,
-        // so a previously-validated bundle with a known-good root remains
-        // good against the new state.
-        self.new_state.wallet_registry_root_check(ctime, check)
     }
     fn network_check(&self, network: &str) -> Result<(), MalformedTransaction<D>> {
         if self.new_state.network_id == network {
@@ -2107,76 +1943,6 @@ mod tests {
     use rand::rngs::StdRng;
     use storage::{arena::Sp, db::InMemoryDB};
     use transient_crypto::curve::Fr;
-
-    // ─── Solution A: registry-root walker tests ────────────────────────────
-
-    #[test]
-    fn extract_historic_roots_finds_bounded_merkle_tree_root() {
-        use transient_crypto::merkle_tree::MerkleTree;
-        let tree = MerkleTree::<(), InMemoryDB>::blank(20)
-            .update_hash(0, HashOutput([1u8; 32]), ())
-            .rehash();
-        let expected_root = tree.root().expect("rehashed tree has root");
-        let state = onchain_runtime::state::StateValue::<InMemoryDB>::BoundedMerkleTree(tree);
-
-        let roots = extract_historic_roots(&state);
-        assert!(
-            roots.contains(&expected_root),
-            "walker should find the BoundedMerkleTree's root"
-        );
-    }
-
-    #[test]
-    fn extract_historic_roots_finds_map_key_digests() {
-        use base_crypto::fab::AlignedValue;
-        use onchain_runtime::state::StateValue;
-        use storage::storage::HashMap;
-        let target_root = MerkleTreeDigest(Fr::from(0x123456u64));
-        let mut m: HashMap<AlignedValue, StateValue<InMemoryDB>, InMemoryDB> = HashMap::new();
-        let key: AlignedValue = target_root.0.into();
-        m = m.insert(key, StateValue::Null);
-        let state = StateValue::<InMemoryDB>::Map(m);
-
-        let roots = extract_historic_roots(&state);
-        assert!(
-            roots.contains(&target_root),
-            "walker should find Field-keyed Map entries as candidate roots"
-        );
-    }
-
-    #[test]
-    fn extract_historic_roots_ignores_unrelated_cells() {
-        use onchain_runtime::state::StateValue;
-        let state = StateValue::<InMemoryDB>::Cell(Sp::new(42u64.into()));
-        let roots = extract_historic_roots(&state);
-        assert!(
-            roots.is_empty(),
-            "walker should not treat opaque Cells as candidate roots"
-        );
-    }
-
-    #[test]
-    fn wallet_registry_contract_address_reads_env() {
-        // Bypass the OnceLock cache by checking the parsing path directly.
-        let hex_address = format!(
-            "0x{}",
-            (0u8..32).map(|b| format!("{:02x}", b)).collect::<String>()
-        );
-        // `wallet_registry_contract_address` caches its first lookup process-
-        // wide via OnceLock; instead, test the parsing-decision logic here.
-        // (The integration path is exercised by the proof-server's
-        // `install_registry_root_checker_from_ledger`.)
-        let clean = hex_address.trim().trim_start_matches("0x");
-        assert_eq!(clean.len(), 64);
-        let mut bytes = [0u8; 32];
-        for (i, chunk) in clean.as_bytes().chunks_exact(2).enumerate() {
-            let s = std::str::from_utf8(chunk).unwrap();
-            bytes[i] = u8::from_str_radix(s, 16).unwrap();
-        }
-        let parsed = ContractAddress(HashOutput(bytes));
-        assert_eq!(parsed.0.0[0], 0);
-        assert_eq!(parsed.0.0[31], 31);
-    }
 
     #[cfg(feature = "proving")]
     #[tokio::test]

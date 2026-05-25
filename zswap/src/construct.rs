@@ -258,11 +258,9 @@ impl<D: DB> Input<ProofPreimage, D> {
 
     /// Split-prove: build spend preimage without raw sk.
     ///
-    /// v3 additions: `commitment_sk` (Poseidon commit to `sk`) and
-    /// `attestation_proof` (one-time wallet attestation) are carried through
-    /// into the emitted bundle so the node admission verifier can re-check
-    /// `pk = persistentHash(sep, sk) ∧ C_sk = transientHash(sep', sk, r)`
-    /// without consulting any ledger state.
+    /// v4 carries only `coin_binding_tag`, `registry_root`, and the
+    /// per-spend client derivation proof in the emitted bundle. Wallet
+    /// first-registration evidence stays client-side in the local POC.
     pub fn new_split<A: Debug + Storable<D>, R: Rng + CryptoRng + ?Sized>(
         rng: &mut R,
         coin: &QualifiedCoinInfo,

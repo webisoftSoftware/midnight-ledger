@@ -30,9 +30,9 @@ use storage::db::InMemoryDB;
 use storage::{Storable, arena::Sp};
 use transient_crypto::commitment::Pedersen;
 use transient_crypto::curve::{EmbeddedFr, EmbeddedGroupAffine, Fr};
-use transient_crypto::merkle_tree::MerkleTreeDigest;
 #[cfg(feature = "proof-verifying")]
 use transient_crypto::hash::transient_commit;
+use transient_crypto::merkle_tree::MerkleTreeDigest;
 use transient_crypto::proofs::PARAMS_VERIFIER;
 #[cfg(feature = "proof-verifying")]
 use transient_crypto::proofs::{ParamsVerifier, VerifierKey};
@@ -168,23 +168,12 @@ impl AuthorizedClaim<Proof> {
     }
 }
 
-/// Process-wide registry-root checker injected by the host (proof-server /
-/// node admission) at startup. The host loads the registry contract address
-/// from `circuits/static/wallet-registry/contract_address.txt` once and
-/// installs a closure that:
-///   1. resolves the registry contract from the current ledger state,
-///   2. extracts its `HistoricMerkleTree<20>` ledger cell,
-///   3. returns `true` iff `root` is in that cell's root history.
+/// Process-wide registry-root checker injected by the host at startup.
 ///
 /// `split_well_formed` invokes the installed closure during admission. If no
-/// checker has been installed the admission fails closed —
-/// `MalformedSplitProofBundle` — protecting against tests that forget to
-/// install the wiring.
-///
-/// This avoids threading `&dyn StateReference` through the zswap → ledger
-/// crate boundary, which would require an invasive trait bound on every
-/// `well_formed` callsite. The plan's `wallet_registry_root_check` lives in
-/// the ledger crate and is what *installs* this closure.
+/// checker has been installed the admission fails closed with
+/// `MalformedSplitProofBundle`, protecting against tests or binaries that
+/// forget to install the local POC wiring.
 pub type RegistryRootChecker = Box<dyn Fn(MerkleTreeDigest) -> bool + Send + Sync>;
 
 lazy_static! {
@@ -194,7 +183,7 @@ lazy_static! {
 
 /// Install a registry-root checker. Idempotent — calling twice replaces the
 /// previously-installed checker. Intended to be called once at process boot
-/// after the registry contract address has been read from configuration.
+/// by proof-server/node/indexer startup.
 pub fn install_registry_root_checker(checker: RegistryRootChecker) {
     *REGISTRY_ROOT_CHECKER
         .write()
@@ -292,10 +281,10 @@ impl<D: DB> Input<Proof, D> {
         //        `registryRoot` to a single `(sk, r, salt, pk, coin, path)`
         //        witness tuple under Poseidon binding for `C_sk` and
         //        `reg_leaf`.
-        //   (ii) registry-root cross-check — `split.registry_root` must
-        //        currently be in the registry contract's `HistoricMerkleTree`
-        //        root history. Soundness of (i) without (ii) is vacuous —
-        //        an attacker could supply any made-up root.
+        //   (ii) registry-root cross-check — `split.registry_root` must be
+        //        accepted by the host-installed checker. Soundness of (i)
+        //        without (ii) is vacuous — an attacker could supply any
+        //        made-up root.
         //   (iii) spend-split proof — the existing server-side circuit, now
         //        with `publicKey`/`coinCommitment` ledger cells dropped (see
         //        `deps/midnight-ledger/zswap/zswap-split.compact`). Binds the

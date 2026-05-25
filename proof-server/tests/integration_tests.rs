@@ -506,9 +506,9 @@ mod split_spend_endpoint {
     use base_crypto::hash::HashOutput;
     use coin_structure::coin;
     use coin_structure::transfer::{Recipient, SenderEvidence};
-    use midnight_proof_server::preview_client::{
-        PreviewSplitProveOptions, PreviewWalletSpend, build_split_spend_handoff,
-        print_staged_report, prove_preview_wallet_split_spend, split_nullifier,
+    use midnight_proof_server::local_poc_client::{
+        LocalPocSplitProveOptions, LocalPocWalletSpend, build_split_spend_handoff,
+        print_staged_report, prove_local_wallet_split_spend, split_nullifier,
     };
     use rand::SeedableRng;
     use rand::rngs::StdRng;
@@ -525,7 +525,7 @@ mod split_spend_endpoint {
     use zswap::ledger::State as ZswapLedgerState;
     use zswap::{Input, ZswapInputProof};
 
-    fn synthetic_wallet_spend() -> PreviewWalletSpend {
+    fn synthetic_wallet_spend() -> LocalPocWalletSpend {
         let mut rng = StdRng::seed_from_u64(0x51504c4954);
         let key = SecretKeys::from_rng_seed(&mut rng);
         synthetic_wallet_spend_with_key_seeded(key, &mut rng)
@@ -534,7 +534,7 @@ mod split_spend_endpoint {
     /// Variant of `synthetic_wallet_spend` that lets the caller supply the
     /// key — used by the unlinkability test which spends two coins from the
     /// same wallet.
-    fn synthetic_wallet_spend_with_key(key: SecretKeys) -> PreviewWalletSpend {
+    fn synthetic_wallet_spend_with_key(key: SecretKeys) -> LocalPocWalletSpend {
         // Use a different seed than `synthetic_wallet_spend` so the
         // generated coin differs.
         let mut rng = StdRng::seed_from_u64(0x51504c4955);
@@ -544,7 +544,7 @@ mod split_spend_endpoint {
     fn synthetic_wallet_spend_with_key_seeded(
         key: SecretKeys,
         rng: &mut StdRng,
-    ) -> PreviewWalletSpend {
+    ) -> LocalPocWalletSpend {
         let coin = coin::Info::new(rng, 100, Default::default());
         let commitment = coin.commitment(&Recipient::User(key.coin_public_key()));
         let nullifier = split_nullifier(&coin, &key.coin_secret_key);
@@ -560,7 +560,7 @@ mod split_spend_endpoint {
         zswap_state.coin_coms_set = HashMap::new().insert(commitment, ());
         zswap_state.first_free = 1;
 
-        PreviewWalletSpend {
+        LocalPocWalletSpend {
             key_index: 0,
             key,
             coin,
@@ -642,25 +642,24 @@ mod split_spend_endpoint {
         // bundle's registry_root. Tests that tamper with the root rely on
         // this being a *single*-root acceptor.
         let admissible_root = bundle.split_public_inputs.registry_root;
-        zswap::verify::install_registry_root_checker(Box::new(move |root| {
-            root == admissible_root
-        }));
+        zswap::verify::install_registry_root_checker(Box::new(move |root| root == admissible_root));
 
-        proved_input
-            .well_formed(0)
-            .expect("ledger verifier accepts split input with client-derivation proof and registered root");
+        proved_input.well_formed(0).expect(
+            "ledger verifier accepts split input with client-derivation proof and registered root",
+        );
 
         let mut tampered_registry_root = proved_input.clone();
         let mut tampered_registry_root_bundle = bundle.clone();
-        tampered_registry_root_bundle.split_public_inputs.registry_root =
-            transient_crypto::merkle_tree::MerkleTreeDigest(
-                transient_crypto::curve::Fr::from(0xdead_beef_u64),
-            );
+        tampered_registry_root_bundle
+            .split_public_inputs
+            .registry_root = transient_crypto::merkle_tree::MerkleTreeDigest(
+            transient_crypto::curve::Fr::from(0xdead_beef_u64),
+        );
         tampered_registry_root.proof =
             std::sync::Arc::new(ZswapInputProof::Split(tampered_registry_root_bundle).encode());
         assert!(
             tampered_registry_root.well_formed(0).is_err(),
-            "ledger verifier must reject a split bundle whose registry_root is not in the contract's root history"
+            "ledger verifier must reject a split bundle whose registry_root is rejected by the checker"
         );
 
         let mut missing_client_proof = proved_input.clone();
@@ -716,8 +715,8 @@ mod split_spend_endpoint {
             // SplitPublicInputs has exactly two fields. Use a small reflection
             // trick: collect their tag-stringified names via serde-json and
             // check we don't accidentally regrow the public-input surface.
-            let as_json = serde_json::to_value(public_inputs)
-                .expect("split public inputs serialize to json");
+            let as_json =
+                serde_json::to_value(public_inputs).expect("split public inputs serialize to json");
             let field_set: HashSet<_> = as_json
                 .as_object()
                 .expect("SplitPublicInputs is an object")
@@ -757,7 +756,7 @@ mod split_spend_endpoint {
     /// This makes wallet identity unrecoverable from a single bundle.
     #[tokio::test]
     async fn synthetic_two_spends_share_only_registry_root() {
-        use midnight_proof_server::preview_client::build_split_spend_handoff;
+        use midnight_proof_server::local_poc_client::build_split_spend_handoff;
 
         let server = start_server(DEFAULT_NUM_WORKERS, DEFAULT_JOB_LIMIT);
 
@@ -779,10 +778,12 @@ mod split_spend_endpoint {
             let mut rng = StdRng::seed_from_u64(0x51504c4956);
             SecretKeys::from_rng_seed(&mut rng)
         });
-        let handoff_b = build_split_spend_handoff(&spend_b).await.expect("b handoff");
+        let handoff_b = build_split_spend_handoff(&spend_b)
+            .await
+            .expect("b handoff");
 
         // The registry_root is the only public value we'd want to compare
-        // across handoffs in production (the synthetic preview uses a
+        // across handoffs in a stricter deployment (the synthetic local POC uses a
         // single-leaf in-memory tree per call, so different registrations
         // produce different roots — we assert *intra-wallet* invariants
         // and *across-wallet* nullifier/binding distinctness).
@@ -824,30 +825,31 @@ mod split_spend_endpoint {
     }
 
     #[tokio::test]
-    async fn preview_wallet_proves_real_unspent_split_spend() {
-        if env::var("MIDNIGHT_RUN_PREVIEW_E2E").as_deref() != Ok("1") {
+    async fn local_wallet_proves_real_unspent_split_spend() {
+        let run_local = env::var("MIDNIGHT_RUN_LOCAL_E2E").as_deref() == Ok("1")
+            || env::var("MIDNIGHT_RUN_PREVIEW_E2E").as_deref() == Ok("1");
+        if !run_local {
             eprintln!(
-                "skipping live preview e2e; set MIDNIGHT_RUN_PREVIEW_E2E=1 with preview wallet env"
+                "skipping local-node e2e; set MIDNIGHT_RUN_LOCAL_E2E=1 with local wallet env"
             );
             return;
         }
 
         // Solution A: install a permissive registry-root checker before the
-        // proof-server starts proving anything. The preview e2e uses a
+        // proof-server starts proving anything. The local-node e2e uses a
         // synthetic single-leaf registry tree built off the wallet's
-        // freshly-generated registration — there's no deployed registry
+        // freshly-generated registration; there's no deployed registry
         // contract to consult, so admission accepts any well-formed root.
-        // Production deployments swap this for a checker that resolves
-        // the deployed registry contract from the live `LedgerState`.
-        midnight_proof_server::install_registry_root_checker_for_demo();
+        midnight_proof_server::install_local_registry_root_checker();
 
         let server = start_server(DEFAULT_NUM_WORKERS, DEFAULT_JOB_LIMIT);
         let base_url = server.base_url();
-        let request_timeout_secs = env::var("MIDNIGHT_PREVIEW_REQUEST_TIMEOUT_SECS")
+        let request_timeout_secs = env::var("MIDNIGHT_LOCAL_REQUEST_TIMEOUT_SECS")
+            .or_else(|_| env::var("MIDNIGHT_PREVIEW_REQUEST_TIMEOUT_SECS"))
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(180);
-        let result = prove_preview_wallet_split_spend(PreviewSplitProveOptions {
+        let result = prove_local_wallet_split_spend(LocalPocSplitProveOptions {
             proof_server_url: &base_url,
             event_limit: None,
             request_timeout_secs,
@@ -868,7 +870,7 @@ mod split_spend_endpoint {
                 || msg.contains("MalformedSplitProofBundle")
             {
                 panic!(
-                    "preview split prove failed; the running local Midnight node \
+                    "local split prove failed; the running local Midnight node \
                      appears to be on pre-Solution-A code (rejected with \
                      `MalformedError::Zswap`). Run `make e2e-full` to rebuild \
                      the docker images, restart the local stack, and rerun.\n\n\
@@ -877,10 +879,10 @@ mod split_spend_endpoint {
             }
         }
 
-        let report = result.expect("preview split prove must succeed");
+        let report = result.expect("local split prove must succeed");
         print_staged_report(&report);
         eprintln!(
-            "split-sent preview output key_index={key_index} mt_index={mt_index} input_value={} transfer_value={} change_value={} token={} recipient={} status={} client_proof_ms={} server_proof_ms={} split_proof_total_ms={} server_client_ratio={} proof_len={} tx_hash={} tx_id={} tx_len={} pre_submit_wasm_check={} inclusion={} block_hash={}",
+            "split-sent local output key_index={key_index} mt_index={mt_index} input_value={} transfer_value={} change_value={} token={} recipient={} status={} client_proof_ms={} server_proof_ms={} split_proof_total_ms={} server_client_ratio={} proof_len={} tx_hash={} tx_id={} tx_len={} pre_submit_wasm_check={} inclusion={} block_hash={}",
             report.coin_value,
             report.transfer_value,
             report.change_value,
