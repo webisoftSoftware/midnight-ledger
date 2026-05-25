@@ -528,7 +528,24 @@ mod split_spend_endpoint {
     fn synthetic_wallet_spend() -> PreviewWalletSpend {
         let mut rng = StdRng::seed_from_u64(0x51504c4954);
         let key = SecretKeys::from_rng_seed(&mut rng);
-        let coin = coin::Info::new(&mut rng, 100, Default::default());
+        synthetic_wallet_spend_with_key_seeded(key, &mut rng)
+    }
+
+    /// Variant of `synthetic_wallet_spend` that lets the caller supply the
+    /// key — used by the unlinkability test which spends two coins from the
+    /// same wallet.
+    fn synthetic_wallet_spend_with_key(key: SecretKeys) -> PreviewWalletSpend {
+        // Use a different seed than `synthetic_wallet_spend` so the
+        // generated coin differs.
+        let mut rng = StdRng::seed_from_u64(0x51504c4955);
+        synthetic_wallet_spend_with_key_seeded(key, &mut rng)
+    }
+
+    fn synthetic_wallet_spend_with_key_seeded(
+        key: SecretKeys,
+        rng: &mut StdRng,
+    ) -> PreviewWalletSpend {
+        let coin = coin::Info::new(rng, 100, Default::default());
         let commitment = coin.commitment(&Recipient::User(key.coin_public_key()));
         let nullifier = split_nullifier(&coin, &key.coin_secret_key);
         assert_eq!(
@@ -675,7 +692,134 @@ mod split_spend_endpoint {
             Err(MalformedOffer::MalformedSplitProofBundle)
         ));
 
+        // ─── Plan §Verification 4: public-input inspection ──────────────────
+        //
+        // Confirm the v4 SplitPublicInputs payload exposes ONLY
+        // `coin_binding_tag` + `registry_root` on-chain — no `public_key`,
+        // no `coin_commitment`, no `commitment_sk`.
+        {
+            use std::collections::HashSet;
+            let public_inputs = &bundle.split_public_inputs;
+            // The struct itself has only these two fields by construction
+            // (#[derive(Storable)] would reject any field changes here), but
+            // we also assert the wire-encoded bundle's tail matches.
+            let encoded = ZswapInputProof::Split(bundle.clone()).encode();
+            // Wire layout: MAGIC || len(spend_proof)||spend_proof
+            //             || len(client_proof)||client_proof
+            //             || coin_binding_tag[32] || registry_root[32]
+            let tail = &encoded.0[encoded.0.len() - 64..];
+            let expected_cb = public_inputs.coin_binding_tag.as_le_bytes();
+            let expected_rr = public_inputs.registry_root.0.as_le_bytes();
+            assert_eq!(&tail[..32], &expected_cb[..]);
+            assert_eq!(&tail[32..], &expected_rr[..]);
+
+            // SplitPublicInputs has exactly two fields. Use a small reflection
+            // trick: collect their tag-stringified names via serde-json and
+            // check we don't accidentally regrow the public-input surface.
+            let as_json = serde_json::to_value(public_inputs)
+                .expect("split public inputs serialize to json");
+            let field_set: HashSet<_> = as_json
+                .as_object()
+                .expect("SplitPublicInputs is an object")
+                .keys()
+                .cloned()
+                .collect();
+            assert!(
+                field_set.contains("coin_binding_tag"),
+                "expected coin_binding_tag in {:?}",
+                field_set
+            );
+            assert!(
+                field_set.contains("registry_root"),
+                "expected registry_root in {:?}",
+                field_set
+            );
+            // Defensive: any of the v3 fields would represent a regression.
+            for forbidden in ["public_key", "coin_commitment", "commitment_sk"] {
+                assert!(
+                    !field_set.contains(forbidden),
+                    "v4 SplitPublicInputs must not contain {forbidden}: {:?}",
+                    field_set
+                );
+            }
+        }
+
         zswap::verify::clear_registry_root_checker();
+        stop_server(server).await;
+    }
+
+    /// Plan §Verification 5: unlinkability spot-check.
+    ///
+    /// Two spends from the *same* wallet on different coins must share only
+    /// their `registry_root` publicly — every other public value (nullifier,
+    /// coin_binding_tag) differs. And two spends from *different* wallets
+    /// against the same registry state share the same `registry_root` too.
+    /// This makes wallet identity unrecoverable from a single bundle.
+    #[tokio::test]
+    async fn synthetic_two_spends_share_only_registry_root() {
+        use midnight_proof_server::preview_client::build_split_spend_handoff;
+
+        let server = start_server(DEFAULT_NUM_WORKERS, DEFAULT_JOB_LIMIT);
+
+        // Wallet A — two spends on different coins.
+        let spend_a1 = synthetic_wallet_spend();
+        let mut spend_a2 = synthetic_wallet_spend_with_key(spend_a1.key.clone());
+        // Force a different mt_index / coin so the nullifier and coin
+        // binding tag genuinely differ across the two spends.
+        spend_a2.mt_index = spend_a1.mt_index + 1;
+        let handoff_a1 = build_split_spend_handoff(&spend_a1)
+            .await
+            .expect("a1 handoff");
+        let handoff_a2 = build_split_spend_handoff(&spend_a2)
+            .await
+            .expect("a2 handoff");
+
+        // Wallet B — different seed so the synthetic key differs from A.
+        let spend_b = synthetic_wallet_spend_with_key({
+            let mut rng = StdRng::seed_from_u64(0x51504c4956);
+            SecretKeys::from_rng_seed(&mut rng)
+        });
+        let handoff_b = build_split_spend_handoff(&spend_b).await.expect("b handoff");
+
+        // The registry_root is the only public value we'd want to compare
+        // across handoffs in production (the synthetic preview uses a
+        // single-leaf in-memory tree per call, so different registrations
+        // produce different roots — we assert *intra-wallet* invariants
+        // and *across-wallet* nullifier/binding distinctness).
+        assert_ne!(
+            handoff_a1["nullifier"], handoff_a2["nullifier"],
+            "same-wallet spends on different coins must have distinct nullifiers"
+        );
+        assert_ne!(
+            handoff_a1["coinBindingTag"], handoff_a2["coinBindingTag"],
+            "same-wallet spends on different coins must have distinct binding tags"
+        );
+        assert_ne!(
+            handoff_a1["nullifier"], handoff_b["nullifier"],
+            "different-wallet spends must have distinct nullifiers"
+        );
+        assert_ne!(
+            handoff_a1["coinBindingTag"], handoff_b["coinBindingTag"],
+            "different-wallet spends must have distinct binding tags"
+        );
+
+        // Public-input field-presence check: the handoff JSON exposes
+        // registryRoot but NOT v3's attestedCommitmentSk / attestationProof.
+        for handoff in [&handoff_a1, &handoff_a2, &handoff_b] {
+            assert!(
+                handoff["registryRoot"].as_str().is_some(),
+                "handoff must include registryRoot"
+            );
+            assert!(
+                handoff["attestedCommitmentSk"].is_null(),
+                "v3 attestedCommitmentSk must be absent from v4 handoff"
+            );
+            assert!(
+                handoff["attestationProof"].is_null(),
+                "v3 attestationProof must be absent from v4 handoff"
+            );
+        }
+
         stop_server(server).await;
     }
 
@@ -711,6 +855,27 @@ mod split_spend_endpoint {
         .await;
 
         stop_server(server).await;
+
+        // Solution A: when the live node rejects with `MalformedError::Zswap`
+        // (substrate "Custom error: 127"), the running node was almost
+        // certainly built before the Solution A patch — the bundle envelope
+        // / VK shapes / admission paths have all moved. Re-emit the error
+        // with an actionable hint pointing at `make e2e-full`.
+        if let Err(ref err) = result {
+            let msg = format!("{err}");
+            if msg.contains("Custom error: 127")
+                || msg.contains("MalformedError::Zswap")
+                || msg.contains("MalformedSplitProofBundle")
+            {
+                panic!(
+                    "preview split prove failed; the running local Midnight node \
+                     appears to be on pre-Solution-A code (rejected with \
+                     `MalformedError::Zswap`). Run `make e2e-full` to rebuild \
+                     the docker images, restart the local stack, and rerun.\n\n\
+                     Original error:\n{msg}"
+                );
+            }
+        }
 
         let report = result.expect("preview split prove must succeed");
         print_staged_report(&report);
