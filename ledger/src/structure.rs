@@ -70,6 +70,7 @@ use storage::storage::{HashMap, HashSet, TimeFilterMap};
 use transient_crypto::commitment::{Pedersen, PedersenRandomness, PureGeneratorPedersen};
 use transient_crypto::curve::FR_BYTES;
 use transient_crypto::curve::Fr;
+use transient_crypto::merkle_tree::MerkleTreeDigest;
 use transient_crypto::proofs::KeyLocation;
 use transient_crypto::proofs::VerifierKey;
 use transient_crypto::proofs::{Proof, ProofPreimage};
@@ -372,9 +373,17 @@ pub trait ProofKind<D: DB>: Ord + Storable<D> + Serializable + Deserializable + 
         offer: &zswap::Offer<Self::LatestProof, D>,
         segment: u16,
     ) -> Result<Pedersen, MalformedOffer>;
+    fn zswap_well_formed_with_registry_policy(
+        offer: &zswap::Offer<Self::LatestProof, D>,
+        segment: u16,
+        registry_policy: &dyn zswap::verify::RegistryRootPolicy,
+    ) -> Result<Pedersen, MalformedOffer>;
     fn zswap_claim_well_formed(
         claim: &zswap::AuthorizedClaim<Self::LatestProof>,
     ) -> Result<(), MalformedOffer>;
+    fn zswap_split_registry_roots(
+        offer: &zswap::Offer<Self::LatestProof, D>,
+    ) -> Result<Vec<MerkleTreeDigest>, MalformedOffer>;
     fn zswap_client_derivation_proofs(offer: &zswap::Offer<Self::LatestProof, D>) -> usize;
     #[allow(clippy::result_large_err)]
     fn proof_verify(
@@ -417,10 +426,22 @@ impl<D: DB> ProofKind<D> for ProofMarker {
     ) -> Result<Pedersen, MalformedOffer> {
         offer.well_formed(segment)
     }
+    fn zswap_well_formed_with_registry_policy(
+        offer: &zswap::Offer<Self::LatestProof, D>,
+        segment: u16,
+        registry_policy: &dyn zswap::verify::RegistryRootPolicy,
+    ) -> Result<Pedersen, MalformedOffer> {
+        offer.well_formed_with_registry_policy(segment, registry_policy)
+    }
     fn zswap_claim_well_formed(
         claim: &zswap::AuthorizedClaim<Self::LatestProof>,
     ) -> Result<(), MalformedOffer> {
         claim.well_formed()
+    }
+    fn zswap_split_registry_roots(
+        offer: &zswap::Offer<Self::LatestProof, D>,
+    ) -> Result<Vec<MerkleTreeDigest>, MalformedOffer> {
+        offer.split_registry_roots()
     }
     fn zswap_client_derivation_proofs(offer: &zswap::Offer<Self::LatestProof, D>) -> usize {
         offer
@@ -528,10 +549,22 @@ impl<D: DB> ProofKind<D> for ProofPreimageMarker {
     ) -> Result<Pedersen, MalformedOffer> {
         offer.well_formed(segment)
     }
+    fn zswap_well_formed_with_registry_policy(
+        offer: &zswap::Offer<Self::LatestProof, D>,
+        segment: u16,
+        _registry_policy: &dyn zswap::verify::RegistryRootPolicy,
+    ) -> Result<Pedersen, MalformedOffer> {
+        offer.well_formed(segment)
+    }
     fn zswap_claim_well_formed(
         _: &zswap::AuthorizedClaim<Self::LatestProof>,
     ) -> Result<(), MalformedOffer> {
         Ok(())
+    }
+    fn zswap_split_registry_roots(
+        _: &zswap::Offer<Self::LatestProof, D>,
+    ) -> Result<Vec<MerkleTreeDigest>, MalformedOffer> {
+        Ok(Vec::new())
     }
     fn zswap_client_derivation_proofs(_: &zswap::Offer<Self::LatestProof, D>) -> usize {
         0
@@ -574,10 +607,22 @@ impl<D: DB> ProofKind<D> for () {
     ) -> Result<Pedersen, MalformedOffer> {
         offer.well_formed(segment)
     }
+    fn zswap_well_formed_with_registry_policy(
+        offer: &zswap::Offer<Self::LatestProof, D>,
+        segment: u16,
+        _registry_policy: &dyn zswap::verify::RegistryRootPolicy,
+    ) -> Result<Pedersen, MalformedOffer> {
+        offer.well_formed(segment)
+    }
     fn zswap_claim_well_formed(
         _: &zswap::AuthorizedClaim<Self::LatestProof>,
     ) -> Result<(), MalformedOffer> {
         Ok(())
+    }
+    fn zswap_split_registry_roots(
+        _: &zswap::Offer<Self::LatestProof, D>,
+    ) -> Result<Vec<MerkleTreeDigest>, MalformedOffer> {
+        Ok(Vec::new())
     }
     fn zswap_client_derivation_proofs(_: &zswap::Offer<Self::LatestProof, D>) -> usize {
         0
@@ -1208,7 +1253,7 @@ pub const INITIAL_LIMITS: TransactionLimits = TransactionLimits {
     feature = "fixed-point-custom-serde",
     derive(serde::Serialize, serde::Deserialize)
 )]
-#[tag = "ledger-parameters[v5]"]
+#[tag = "ledger-parameters[v6]"]
 #[storable(base)]
 pub struct LedgerParameters {
     pub cost_model: TransactionCostModel,
@@ -1216,6 +1261,8 @@ pub struct LedgerParameters {
     pub dust: DustParameters,
     pub fee_prices: FeePrices,
     pub global_ttl: Duration,
+    #[cfg_attr(feature = "fixed-point-custom-serde", serde(default))]
+    pub split_registry_contract: Option<ContractAddress>,
     // Valid range of 0..1
     #[cfg_attr(
         feature = "fixed-point-custom-serde",
@@ -1288,6 +1335,7 @@ pub const INITIAL_PARAMETERS: LedgerParameters = LedgerParameters {
         write_factor: FixedPoint::ONE,
     },
     global_ttl: Duration::from_secs(3600),
+    split_registry_contract: None,
     cardano_to_midnight_bridge_fee_basis_points: 500,
     cost_dimension_min_ratio: FixedPoint::from_u64_div(1, 4),
     price_adjustment_a_parameter: FixedPoint::from_u64_div(100, 1),

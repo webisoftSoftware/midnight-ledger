@@ -1,2 +1,5 @@
 ledger-v6.d.ts
 ledger-v8.d.ts
+pkg/
+package/
+midnight-ledger-v8-*.tgz

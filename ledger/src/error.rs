@@ -512,6 +512,16 @@ pub enum MalformedTransaction<D: DB> {
         segment: u16,
         overspent_value: i128,
     },
+    SplitRegistryContractUnconfigured,
+    SplitRegistryContractNotPresent(ContractAddress),
+    MalformedSplitRegistryState {
+        address: ContractAddress,
+    },
+    SplitRegistryRootNotCurrent {
+        address: ContractAddress,
+        registry_root: transient_crypto::merkle_tree::MerkleTreeDigest,
+        current_root: transient_crypto::merkle_tree::MerkleTreeDigest,
+    },
     EffectsCheckFailure(EffectsCheckError),
     DisjointCheckFailure(DisjointCheckError<D>),
     SequencingCheckFailure(SequencingCheckError),
@@ -1010,6 +1020,31 @@ impl<D: DB> Display for MalformedTransaction<D> {
                     "invalid balance {overspent_value} for token {token_type:?} in segment {segment}; balance must be positive"
                 )
             }
+            SplitRegistryContractUnconfigured => write!(
+                formatter,
+                "split registry contract is not configured in ledger parameters"
+            ),
+            SplitRegistryContractNotPresent(address) => {
+                write!(
+                    formatter,
+                    "split registry contract {:?} does not exist",
+                    address
+                )
+            }
+            MalformedSplitRegistryState { address } => write!(
+                formatter,
+                "split registry contract {:?} has malformed registry state",
+                address
+            ),
+            SplitRegistryRootNotCurrent {
+                address,
+                registry_root,
+                current_root,
+            } => write!(
+                formatter,
+                "split registry root {:?} is not the current root {:?} for registry contract {:?}",
+                registry_root, current_root, address
+            ),
             EffectsCheckFailure(effects_check) => effects_check.fmt(formatter),
             DisjointCheckFailure(disjoint_check) => disjoint_check.fmt(formatter),
             SequencingCheckFailure(sequencing_check) => sequencing_check.fmt(formatter),

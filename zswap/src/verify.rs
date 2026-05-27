@@ -65,7 +65,7 @@ const SPEND_SPLIT_VK_RAW: &[u8] = include_bytes!("../static/spend-split.verifier
 const CLIENT_DERIVATION_VK_RAW: &[u8] = include_bytes!("../static/client-derivation.verifier");
 // Solution A: the wallet attestation proof no longer travels with split-spend
 // bundles; per-spend admission only checks the client-derivation proof and
-// the registry-root cross-check installed via `install_registry_root_checker`.
+// the caller-provided registry-root policy.
 #[cfg(feature = "proof-verifying")]
 const SIGN_VK_RAW: &[u8] = include_bytes!("../static/sign.verifier");
 #[cfg(feature = "proof-verifying")]
@@ -168,63 +168,91 @@ impl AuthorizedClaim<Proof> {
     }
 }
 
-/// Process-wide registry-root checker injected by the host at startup.
+/// Admission policy for split-spend registry roots.
 ///
-/// `split_well_formed` invokes the installed closure during admission. If no
-/// checker has been installed the admission fails closed with
-/// `MalformedSplitProofBundle`, protecting against tests or binaries that
-/// forget to install the local POC wiring.
-pub type RegistryRootChecker = Box<dyn Fn(MerkleTreeDigest) -> bool + Send + Sync>;
-
-lazy_static! {
-    static ref REGISTRY_ROOT_CHECKER: std::sync::RwLock<Option<RegistryRootChecker>> =
-        std::sync::RwLock::new(None);
+/// Proof verification is still stateless: the verifier only asks whether the
+/// root embedded in the split proof bundle is admissible for this call.
+pub trait RegistryRootPolicy {
+    fn admits_registry_root(&self, root: MerkleTreeDigest) -> bool;
 }
 
-/// Install a registry-root checker. Idempotent — calling twice replaces the
-/// previously-installed checker. Intended to be called once at process boot
-/// by proof-server/node/indexer startup.
-pub fn install_registry_root_checker(checker: RegistryRootChecker) {
-    *REGISTRY_ROOT_CHECKER
-        .write()
-        .expect("registry root checker mutex poisoned") = Some(checker);
+impl<F> RegistryRootPolicy for F
+where
+    F: Fn(MerkleTreeDigest) -> bool,
+{
+    fn admits_registry_root(&self, root: MerkleTreeDigest) -> bool {
+        self(root)
+    }
 }
 
-/// Clear the installed checker (mainly for tests).
-pub fn clear_registry_root_checker() {
-    *REGISTRY_ROOT_CHECKER
-        .write()
-        .expect("registry root checker mutex poisoned") = None;
+pub struct RejectAllRegistryRootPolicy;
+
+impl RegistryRootPolicy for RejectAllRegistryRootPolicy {
+    fn admits_registry_root(&self, _root: MerkleTreeDigest) -> bool {
+        false
+    }
 }
 
-fn check_registry_root(root: MerkleTreeDigest) -> Result<(), MalformedOffer> {
-    let guard = REGISTRY_ROOT_CHECKER
-        .read()
-        .expect("registry root checker mutex poisoned");
-    match guard.as_ref() {
-        Some(check) if check(root) => Ok(()),
-        Some(_) => Err(MalformedOffer::MalformedSplitProofBundle),
-        // No checker installed → fail closed. The proof-server / node admission
-        // path is responsible for calling `install_registry_root_checker`
-        // before verifying any split-spend transaction.
-        None => Err(MalformedOffer::MalformedSplitProofBundle),
+pub struct AcceptAllRegistryRootPolicy;
+
+impl RegistryRootPolicy for AcceptAllRegistryRootPolicy {
+    fn admits_registry_root(&self, _root: MerkleTreeDigest) -> bool {
+        true
+    }
+}
+
+fn check_registry_root(
+    root: MerkleTreeDigest,
+    policy: &dyn RegistryRootPolicy,
+) -> Result<(), MalformedOffer> {
+    if policy.admits_registry_root(root) {
+        Ok(())
+    } else {
+        Err(MalformedOffer::MalformedSplitProofBundle)
     }
 }
 
 impl<D: DB> Input<Proof, D> {
     #[cfg(not(feature = "proof-verifying"))]
-    pub fn well_formed(&self, _segment: u16) -> Result<(), MalformedOffer> {
-        Ok(())
+    pub fn well_formed(&self, segment: u16) -> Result<(), MalformedOffer> {
+        self.well_formed_with_registry_policy(segment, &RejectAllRegistryRootPolicy)
+    }
+
+    #[cfg(not(feature = "proof-verifying"))]
+    pub fn well_formed_with_registry_policy(
+        &self,
+        _segment: u16,
+        registry_policy: &dyn RegistryRootPolicy,
+    ) -> Result<(), MalformedOffer> {
+        match ZswapInputProof::decode(&self.proof)
+            .map_err(|_| MalformedOffer::MalformedSplitProofBundle)?
+        {
+            ZswapInputProof::Plain(_) => Ok(()),
+            ZswapInputProof::Split(split_bundle) => check_registry_root(
+                split_bundle.split_public_inputs.registry_root,
+                registry_policy,
+            ),
+        }
     }
 
     #[instrument]
     #[cfg(feature = "proof-verifying")]
     pub fn well_formed(&self, segment: u16) -> Result<(), MalformedOffer> {
+        self.well_formed_with_registry_policy(segment, &RejectAllRegistryRootPolicy)
+    }
+
+    #[instrument(skip(self, registry_policy))]
+    #[cfg(feature = "proof-verifying")]
+    pub fn well_formed_with_registry_policy(
+        &self,
+        segment: u16,
+        registry_policy: &dyn RegistryRootPolicy,
+    ) -> Result<(), MalformedOffer> {
         let input_proof = ZswapInputProof::decode(&self.proof)
             .map_err(|_| MalformedOffer::MalformedSplitProofBundle)?;
 
         if let ZswapInputProof::Split(split_bundle) = input_proof {
-            return self.split_well_formed(segment, &split_bundle);
+            return self.split_well_formed(segment, &split_bundle, registry_policy);
         }
 
         let mut prog = Vec::new();
@@ -271,6 +299,7 @@ impl<D: DB> Input<Proof, D> {
         &self,
         segment: u16,
         split_bundle: &SplitProofBundle,
+        registry_policy: &dyn RegistryRootPolicy,
     ) -> Result<(), MalformedOffer> {
         let split = &split_bundle.split_public_inputs;
         // Solution A admission chain:
@@ -282,7 +311,7 @@ impl<D: DB> Input<Proof, D> {
         //        witness tuple under Poseidon binding for `C_sk` and
         //        `reg_leaf`.
         //   (ii) registry-root cross-check — `split.registry_root` must be
-        //        accepted by the host-installed checker. Soundness of (i)
+        //        accepted by the caller-provided policy. Soundness of (i)
         //        without (ii) is vacuous — an attacker could supply any
         //        made-up root.
         //   (iii) spend-split proof — the existing server-side circuit, now
@@ -294,7 +323,7 @@ impl<D: DB> Input<Proof, D> {
             &split_bundle.client_derivation_proof,
             self.nullifier,
         )?;
-        check_registry_root(split.registry_root)?;
+        check_registry_root(split.registry_root, registry_policy)?;
 
         let mut split_prog = Vec::new();
         split_prog.extend::<[Op<ResultModeGather, InMemoryDB>; 6]>(HistoricMerkleTree_check_root!(
@@ -349,6 +378,15 @@ impl<D: DB> Input<Proof, D> {
                 split_statement.iter().copied(),
             )
             .map_err(MalformedOffer::InvalidProof)
+    }
+
+    pub fn split_registry_root(&self) -> Result<Option<MerkleTreeDigest>, MalformedOffer> {
+        match ZswapInputProof::decode(&self.proof)
+            .map_err(|_| MalformedOffer::MalformedSplitProofBundle)?
+        {
+            ZswapInputProof::Plain(_) => Ok(None),
+            ZswapInputProof::Split(bundle) => Ok(Some(bundle.split_public_inputs.registry_root)),
+        }
     }
 }
 
@@ -487,7 +525,16 @@ impl<D: DB> Output<(), D> {
 
 impl<D: DB> Transient<Proof, D> {
     pub fn well_formed(&self, segment: u16) -> Result<(), MalformedOffer> {
-        self.as_input().well_formed(segment)?;
+        self.well_formed_with_registry_policy(segment, &RejectAllRegistryRootPolicy)
+    }
+
+    pub fn well_formed_with_registry_policy(
+        &self,
+        segment: u16,
+        registry_policy: &dyn RegistryRootPolicy,
+    ) -> Result<(), MalformedOffer> {
+        self.as_input()
+            .well_formed_with_registry_policy(segment, registry_policy)?;
         self.as_output().well_formed(segment)?;
         Ok(())
     }
@@ -547,16 +594,43 @@ fn offer_well_formed_common<P: Ord + Storable<D>, D: DB>(
 impl<D: DB> Offer<Proof, D> {
     #[instrument(skip(self))]
     pub fn well_formed(&self, segment: u16) -> Result<Pedersen, MalformedOffer> {
+        self.well_formed_with_registry_policy(segment, &RejectAllRegistryRootPolicy)
+    }
+
+    #[instrument(skip(self, registry_policy))]
+    pub fn well_formed_with_registry_policy(
+        &self,
+        segment: u16,
+        registry_policy: &dyn RegistryRootPolicy,
+    ) -> Result<Pedersen, MalformedOffer> {
         self.inputs
             .iter()
-            .try_for_each(|i| i.well_formed(segment))?;
+            .try_for_each(|i| i.well_formed_with_registry_policy(segment, registry_policy))?;
         self.outputs
             .iter()
             .try_for_each(|o| o.well_formed(segment))?;
         self.transient
             .iter()
-            .try_for_each(|t| t.well_formed(segment))?;
+            .try_for_each(|t| t.well_formed_with_registry_policy(segment, registry_policy))?;
         offer_well_formed_common(self, segment)
+    }
+
+    pub fn split_registry_roots(&self) -> Result<Vec<MerkleTreeDigest>, MalformedOffer> {
+        let mut roots = self
+            .inputs
+            .iter()
+            .try_fold(Vec::new(), |mut roots, input| {
+                if let Some(root) = input.split_registry_root()? {
+                    roots.push(root);
+                }
+                Ok(roots)
+            })?;
+        for transient in self.transient.iter() {
+            if let Some(root) = transient.as_input().split_registry_root()? {
+                roots.push(root);
+            }
+        }
+        Ok(roots)
     }
 }
 

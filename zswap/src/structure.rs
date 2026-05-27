@@ -250,8 +250,8 @@ pub struct SplitPublicInputs {
     /// Tag binding the client and server split proofs to the same `(coin, pk)`.
     pub coin_binding_tag: Fr,
     /// Solution A: registry-tree root the per-spend membership proof resolves
-    /// to. The admission verifier checks this root through the host-installed
-    /// registry-root checker. The wallet's `(pk, C_sk)` are no longer publicly
+    /// to. The admission verifier checks this root through an explicit
+    /// registry-root policy. The wallet's `(pk, C_sk)` are no longer publicly
     /// disclosed; the per-spend proof opens its `reg_leaf` to a blinded
     /// preimage under Poseidon binding.
     pub registry_root: MerkleTreeDigest,

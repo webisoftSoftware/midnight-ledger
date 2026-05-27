@@ -1,0 +1,8 @@
+FROM lukemathwalker/cargo-chef:0.1.77-rust-1.94.0-trixie
+
+ENV PATH="/usr/local/cargo/bin:${PATH}"
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends clang lld ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && rustup target add wasm32-unknown-unknown

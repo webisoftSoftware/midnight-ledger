@@ -36,7 +36,7 @@ use coin_structure::contract::ContractAddress;
 use onchain_runtime::ops::Op;
 use onchain_runtime::state::{
     ChargedState, ContractMaintenanceAuthority, ContractOperation, ContractState, EntryPoint,
-    EntryPointBuf,
+    EntryPointBuf, StateValue,
 };
 use onchain_runtime::transcript::Transcript;
 use serialize::{Serializable, Tagged};
@@ -95,6 +95,13 @@ pub trait StateReference<D: DB> {
             DustParameters,
             MerkleTreeDigest,
             MerkleTreeDigest,
+        ) -> Result<(), MalformedTransaction<D>>,
+    ) -> Result<(), MalformedTransaction<D>>;
+    fn split_registry_check(
+        &self,
+        check: impl FnOnce(
+            &LedgerParameters,
+            Option<&ContractState<D>>,
         ) -> Result<(), MalformedTransaction<D>>,
     ) -> Result<(), MalformedTransaction<D>>;
     fn network_check(&self, network: &str) -> Result<(), MalformedTransaction<D>>;
@@ -192,6 +199,19 @@ impl<D: DB> StateReference<D> for LedgerState<D> {
             .map(|x| x.0)
             .unwrap_or_default();
         check(params, commitment_root, generation_root)
+    }
+    fn split_registry_check(
+        &self,
+        check: impl FnOnce(
+            &LedgerParameters,
+            Option<&ContractState<D>>,
+        ) -> Result<(), MalformedTransaction<D>>,
+    ) -> Result<(), MalformedTransaction<D>> {
+        let registry_contract = self
+            .parameters
+            .split_registry_contract
+            .and_then(|address| self.contract.get(&address));
+        check(&self.parameters, registry_contract)
     }
     fn network_check(&self, network: &str) -> Result<(), MalformedTransaction<D>> {
         if self.network_id == network {
@@ -333,6 +353,20 @@ impl<D: DB> StateReference<D> for RevalidationReference<D> {
             check(params_new, commitment_root_new, generation_root_new)
         }
     }
+    fn split_registry_check(
+        &self,
+        check: impl FnOnce(
+            &LedgerParameters,
+            Option<&ContractState<D>>,
+        ) -> Result<(), MalformedTransaction<D>>,
+    ) -> Result<(), MalformedTransaction<D>> {
+        let registry_contract = self
+            .new_state
+            .parameters
+            .split_registry_contract
+            .and_then(|address| self.new_state.contract.get(&address));
+        check(&self.new_state.parameters, registry_contract)
+    }
     fn network_check(&self, network: &str) -> Result<(), MalformedTransaction<D>> {
         if self.new_state.network_id == network {
             Ok(())
@@ -430,6 +464,67 @@ where
 {
     let mut uniq = BTreeSet::new();
     iter.into_iter().all(|x| uniq.insert(x))
+}
+
+fn split_registry_dev_accept_all() -> bool {
+    std::env::var("MIDNIGHT_SPLIT_REGISTRY_DEV_ACCEPT_ALL").as_deref() == Ok("1")
+}
+
+fn current_split_registry_root<D: DB>(
+    contract_state: &ContractState<D>,
+    address: ContractAddress,
+) -> Result<MerkleTreeDigest, MalformedTransaction<D>> {
+    let malformed = || MalformedTransaction::MalformedSplitRegistryState { address };
+    let top_level = match contract_state.data.get_ref() {
+        StateValue::Array(top_level) => top_level,
+        _ => return Err(malformed()),
+    };
+    let historic_tree = match top_level.get(0) {
+        Some(StateValue::Array(historic_tree)) => historic_tree,
+        _ => return Err(malformed()),
+    };
+    let current_tree = match historic_tree.get(0) {
+        Some(StateValue::BoundedMerkleTree(current_tree)) if current_tree.height() == 20 => {
+            current_tree
+        }
+        _ => return Err(malformed()),
+    };
+    current_tree.root().ok_or_else(malformed)
+}
+
+fn validate_split_registry_roots<D: DB>(
+    ref_state: &impl StateReference<D>,
+    roots: &BTreeSet<MerkleTreeDigest>,
+) -> Result<(), MalformedTransaction<D>> {
+    if roots.is_empty() {
+        return Ok(());
+    }
+    if split_registry_dev_accept_all() {
+        warn!(
+            root_count = roots.len(),
+            "MIDNIGHT_SPLIT_REGISTRY_DEV_ACCEPT_ALL=1: accepting split registry roots without ledger-state validation"
+        );
+        return Ok(());
+    }
+    ref_state.split_registry_check(|params, registry_contract| {
+        let address = params
+            .split_registry_contract
+            .ok_or(MalformedTransaction::SplitRegistryContractUnconfigured)?;
+        let registry_contract = registry_contract.ok_or(
+            MalformedTransaction::SplitRegistryContractNotPresent(address),
+        )?;
+        let current_root = current_split_registry_root(registry_contract, address)?;
+        for registry_root in roots {
+            if *registry_root != current_root {
+                return Err(MalformedTransaction::SplitRegistryRootNotCurrent {
+                    address,
+                    registry_root: *registry_root,
+                    current_root,
+                });
+            }
+        }
+        Ok(())
+    })
 }
 
 impl<S: SignatureKind<D>, D: DB> UnshieldedOffer<S, D> {
@@ -583,21 +678,30 @@ where
                     stx.ttl_check_weak(tblock, params.global_ttl)
                         .map_err(MalformedTransaction::TransactionApplicationError)
                 })?;
+                let split_registry_roots = stx.split_registry_roots()?;
+                validate_split_registry_roots(ref_state, &split_registry_roots)?;
+                let split_registry_policy =
+                    |root: MerkleTreeDigest| split_registry_roots.contains(&root);
                 ref_state.stateless_check(|| {
                     stx.guaranteed_coins
                         .as_ref()
                         .map(|x| {
-                            P::zswap_well_formed(x, 0).map_err(MalformedTransaction::<D>::from)
+                            P::zswap_well_formed_with_registry_policy(x, 0, &split_registry_policy)
+                                .map_err(MalformedTransaction::<D>::from)
                         })
                         .transpose()?;
                     for seg_x_offer in stx.fallible_coins.iter() {
                         if *seg_x_offer.0 == 0 {
                             return Err(MalformedTransaction::IllegallyDeclaredGuaranteed);
                         }
-                        P::zswap_well_formed(&seg_x_offer.1.clone(), *seg_x_offer.0.deref())
-                            .map_err(|e: zswap::error::MalformedOffer| {
-                                MalformedTransaction::<D>::Zswap(e)
-                            })?;
+                        P::zswap_well_formed_with_registry_policy(
+                            &seg_x_offer.1.clone(),
+                            *seg_x_offer.0.deref(),
+                            &split_registry_policy,
+                        )
+                        .map_err(|e: zswap::error::MalformedOffer| {
+                            MalformedTransaction::<D>::Zswap(e)
+                        })?;
                     }
                     stx.disjoint_check()?;
                     stx.effects_check()?;
@@ -670,6 +774,22 @@ where
 }
 
 impl<S: SignatureKind<D>, P: ProofKind<D>, B: Storable<D>, D: DB> StandardTransaction<S, P, B, D> {
+    fn split_registry_roots(&self) -> Result<BTreeSet<MerkleTreeDigest>, MalformedTransaction<D>> {
+        let mut roots = BTreeSet::new();
+        if let Some(offer) = self.guaranteed_coins.as_ref() {
+            roots.extend(
+                P::zswap_split_registry_roots(offer).map_err(MalformedTransaction::<D>::Zswap)?,
+            );
+        }
+        for seg_x_offer in self.fallible_coins.iter() {
+            roots.extend(
+                P::zswap_split_registry_roots(&seg_x_offer.1.clone())
+                    .map_err(MalformedTransaction::<D>::Zswap)?,
+            );
+        }
+        Ok(roots)
+    }
+
     pub fn balance(
         &self,
         fees: Option<u128>,
@@ -1924,6 +2044,70 @@ impl<P: ProofKind<D>, D: DB> ContractCall<P, D> {
         hasher.update(&binding_input[..]);
         Fr::from_le_bytes(&hasher.finalize()[..31])
             .expect("Trimmed persistent hash should fall in Fr")
+    }
+}
+
+#[cfg(test)]
+mod split_registry_tests {
+    use super::*;
+    use base_crypto::hash::HashOutput;
+    use coin_structure::contract::ContractAddress;
+    use onchain_runtime::state::ContractMaintenanceAuthority;
+    use storage::{arena::Sp, db::InMemoryDB};
+
+    fn registry_contract_state(
+        tree: transient_crypto::merkle_tree::MerkleTree<(), InMemoryDB>,
+    ) -> ContractState<InMemoryDB> {
+        let historic_tree = StateValue::Array(
+            vec![
+                StateValue::BoundedMerkleTree(tree),
+                StateValue::Cell(Sp::new(0u64.into())),
+                StateValue::Map(storage::storage::HashMap::default()),
+            ]
+            .into(),
+        );
+        let top_level = StateValue::Array(vec![historic_tree].into());
+        ContractState::new(
+            top_level,
+            storage::storage::HashMap::default(),
+            ContractMaintenanceAuthority::default(),
+        )
+    }
+
+    #[test]
+    fn split_registry_state_parser_reads_current_tree_root() {
+        let tree = transient_crypto::merkle_tree::MerkleTree::blank(20)
+            .update_hash(0, HashOutput([7u8; 32]), ())
+            .rehash();
+        let expected_root = tree.root().expect("rehashed registry tree has a root");
+        let state = registry_contract_state(tree);
+        let address = ContractAddress(HashOutput([1u8; 32]));
+
+        assert_eq!(
+            current_split_registry_root(&state, address).expect("registry state parses"),
+            expected_root
+        );
+    }
+
+    #[test]
+    fn split_registry_state_parser_rejects_malformed_state() {
+        let address = ContractAddress(HashOutput([1u8; 32]));
+        let empty_top_level = ContractState::new(
+            StateValue::Array(Vec::<StateValue<InMemoryDB>>::new().into()),
+            storage::storage::HashMap::default(),
+            ContractMaintenanceAuthority::default(),
+        );
+        assert!(matches!(
+            current_split_registry_root(&empty_top_level, address),
+            Err(MalformedTransaction::MalformedSplitRegistryState { .. })
+        ));
+
+        let wrong_height =
+            registry_contract_state(transient_crypto::merkle_tree::MerkleTree::blank(19).rehash());
+        assert!(matches!(
+            current_split_registry_root(&wrong_height, address),
+            Err(MalformedTransaction::MalformedSplitRegistryState { .. })
+        ));
     }
 }
 

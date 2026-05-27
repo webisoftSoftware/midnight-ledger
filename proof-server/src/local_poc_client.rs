@@ -535,9 +535,9 @@ pub async fn build_split_spend_handoff_timed(
     let attestation_elapsed = attestation_start.elapsed();
 
     // Build a single-leaf registry tree mirroring the state after this wallet's
-    // synthetic first registration. For now the
-    // local POC uses this synthetic in-memory tree and a permissive
-    // registry-root checker in the local proof-server/node/indexer.
+    // synthetic first registration. This path is accepted by ledger admission
+    // only when the node/indexer process opts in with
+    // MIDNIGHT_SPLIT_REGISTRY_DEV_ACCEPT_ALL=1.
     let registry_witness = build_first_registration_witness(&registration)?;
 
     let proving_start = Instant::now();

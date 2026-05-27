@@ -31,14 +31,17 @@ pub mod local_poc_client;
 pub mod versioned_ir;
 pub mod worker_pool;
 
-/// Install a permissive registry-root checker for the local-node POC.
+/// Log whether the explicit dev-only split registry bypass is enabled.
 ///
-/// Zswap admission fails closed when no checker is installed. The local POC
-/// uses a synthetic client-side registry witness rather than deployed registry
-/// state, so the proof-server accepts any well-formed root.
+/// Production admission validates split registry roots against ledger state.
+/// Synthetic local roots are accepted only when the node/indexer process is
+/// started with `MIDNIGHT_SPLIT_REGISTRY_DEV_ACCEPT_ALL=1`.
 pub fn install_local_registry_root_checker() {
-    zswap::verify::install_registry_root_checker(Box::new(|_root| true));
-    tracing::warn!("Solution A: local POC registry-root checker installed (accepts all roots)");
+    if std::env::var("MIDNIGHT_SPLIT_REGISTRY_DEV_ACCEPT_ALL").as_deref() == Ok("1") {
+        tracing::warn!(
+            "MIDNIGHT_SPLIT_REGISTRY_DEV_ACCEPT_ALL=1: synthetic split registry roots are accepted by ledger admission"
+        );
+    }
 }
 
 pub fn server(port: u16, fetch_params: bool, pool: WorkerPool) -> std::io::Result<(Server, u16)> {

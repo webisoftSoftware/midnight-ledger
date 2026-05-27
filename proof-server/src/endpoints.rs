@@ -257,10 +257,9 @@ pub(crate) async fn prove_split_spend(
     }
     // Solution A: split spends now carry only a `registry_root` (no
     // per-spend wallet attestation). Pre-verify the client-derivation proof
-    // before doing any prover work so a malformed spend fails fast. The node
-    // admission path adds the registry-root cross-check through the
-    // host-installed checker — see `install_registry_root_checker` in
-    // zswap/src/verify.rs. Local POC binaries install a permissive checker.
+    // before doing any prover work so a malformed spend fails fast. Node
+    // admission validates the registry root against the configured registry
+    // contract's current tree root.
     let registry_root_fr = request
         .registry_root
         .as_deref()

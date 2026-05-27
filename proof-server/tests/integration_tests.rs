@@ -638,14 +638,20 @@ mod split_spend_endpoint {
         // `registry_root` and `coin_binding_tag`.
         assert_eq!(bundle.split_public_inputs.coin_binding_tag, expected_tag);
 
-        // Install a registry-root checker that accepts only this exact
-        // bundle's registry_root. Tests that tamper with the root rely on
-        // this being a *single*-root acceptor.
+        // Verify with an explicit registry-root policy that accepts only this
+        // bundle's registry_root. Tests that tamper with the root rely on this
+        // being a single-root acceptor.
         let admissible_root = bundle.split_public_inputs.registry_root;
-        zswap::verify::install_registry_root_checker(Box::new(move |root| root == admissible_root));
+        let registry_policy = |root| root == admissible_root;
 
-        proved_input.well_formed(0).expect(
-            "ledger verifier accepts split input with client-derivation proof and registered root",
+        proved_input
+            .well_formed_with_registry_policy(0, &registry_policy)
+            .expect(
+                "ledger verifier accepts split input with client-derivation proof and registered root",
+            );
+        assert!(
+            proved_input.well_formed(0).is_err(),
+            "direct zswap well_formed must reject split bundles without an explicit registry policy"
         );
 
         let mut tampered_registry_root = proved_input.clone();
@@ -658,8 +664,10 @@ mod split_spend_endpoint {
         tampered_registry_root.proof =
             std::sync::Arc::new(ZswapInputProof::Split(tampered_registry_root_bundle).encode());
         assert!(
-            tampered_registry_root.well_formed(0).is_err(),
-            "ledger verifier must reject a split bundle whose registry_root is rejected by the checker"
+            tampered_registry_root
+                .well_formed_with_registry_policy(0, &registry_policy)
+                .is_err(),
+            "ledger verifier must reject a split bundle whose registry_root is rejected by the policy"
         );
 
         let mut missing_client_proof = proved_input.clone();
@@ -743,7 +751,6 @@ mod split_spend_endpoint {
             }
         }
 
-        zswap::verify::clear_registry_root_checker();
         stop_server(server).await;
     }
 
@@ -835,11 +842,10 @@ mod split_spend_endpoint {
             return;
         }
 
-        // Solution A: install a permissive registry-root checker before the
-        // proof-server starts proving anything. The local-node e2e uses a
-        // synthetic single-leaf registry tree built off the wallet's
-        // freshly-generated registration; there's no deployed registry
-        // contract to consult, so admission accepts any well-formed root.
+        // The synthetic local-node path now requires the node/indexer process
+        // to be started with MIDNIGHT_SPLIT_REGISTRY_DEV_ACCEPT_ALL=1. Without
+        // that flag, ledger admission accepts only the configured registry
+        // contract's current root.
         midnight_proof_server::install_local_registry_root_checker();
 
         let server = start_server(DEFAULT_NUM_WORKERS, DEFAULT_JOB_LIMIT);
