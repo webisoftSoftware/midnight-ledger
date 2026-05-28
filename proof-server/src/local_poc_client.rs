@@ -47,6 +47,10 @@ const CLIENT_DERIVATION_KEY_LOCATION: &str = "split/client/sk-derivation";
 /// Solution A wallet-attestation circuit. In the local POC this is off-chain
 /// evidence for the synthetic first-registration witness.
 const WALLET_ATTESTATION_KEY_LOCATION: &str = "split/wallet/attestation";
+/// Compact-generated key location for `wallet_registry.register(leaf)`. The
+/// `compact compile` toolchain stores it under `keys/register.{prover,verifier}`
+/// so the `KeyLocation` is the bare circuit name.
+pub(crate) const REGISTER_KEY_LOCATION: &str = "register";
 /// Domain separator for the Poseidon `C_sk` commitment.
 const SK_COMMIT_SEPARATOR: &str = "midnight:sk-commit[v1]";
 /// Domain separator for the registration leaf `reg_leaf`.
@@ -865,7 +869,7 @@ pub fn local_poc_env() -> HashMap<String, String> {
     values
 }
 
-fn env_value(env: &HashMap<String, String>, key: &str) -> String {
+pub fn env_value(env: &HashMap<String, String>, key: &str) -> String {
     env.get(key)
         .cloned()
         .or_else(|| {
@@ -875,7 +879,7 @@ fn env_value(env: &HashMap<String, String>, key: &str) -> String {
         .unwrap_or_default()
 }
 
-fn env_value_or(env: &HashMap<String, String>, key: &str, default: &str) -> String {
+pub(crate) fn env_value_or(env: &HashMap<String, String>, key: &str, default: &str) -> String {
     let value = env_value(env, key);
     if value.trim().is_empty() {
         default.to_string()
@@ -956,7 +960,7 @@ ws.addEventListener('error', (event) => {{
     Ok(serde_json::from_slice(&output.stdout)?)
 }
 
-fn local_zswap_secret_keys_scan(
+pub fn local_zswap_secret_keys_scan(
     env: &HashMap<String, String>,
 ) -> LocalPocResult<Vec<(usize, SecretKeys)>> {
     let scan_limit = env_value(env, "MIDNIGHT_LOCAL_ZSWAP_KEY_SCAN_LIMIT")
@@ -1071,7 +1075,7 @@ fn client_derivation_public_transcript_inputs(
 /// the in-circuit `regLeaf` value; the proof is off-chain evidence and is not
 /// part of any split bundle.
 #[derive(Debug, Clone)]
-pub(crate) struct LocalPocWalletRegistration {
+pub struct LocalPocWalletRegistration {
     pub blinding: Fr,
     pub salt: Fr,
     /// In-circuit `regLeaf` Field. Kept for diagnostics — the upgrade
@@ -1171,7 +1175,7 @@ fn wallet_attestation_public_transcript_inputs(reg_leaf_fr: Fr) -> Vec<Fr> {
 
 /// Generate the per-run wallet registration. Live e2e runs this once and
 /// reuses the result on every spend in that run.
-pub(crate) async fn prove_wallet_attestation(
+pub async fn prove_wallet_attestation(
     sk: &coin_structure::coin::SecretKey,
 ) -> LocalPocResult<LocalPocWalletRegistration> {
     let r: Fr = OsRng.r#gen();
@@ -1211,12 +1215,12 @@ fn extend_ops<const N: usize>(inputs: &mut Vec<Fr>, ops: [Op<ResultModeVerify, I
     }
 }
 
-struct ClientDerivationResolver<P> {
+pub(crate) struct ClientDerivationResolver<P> {
     params_and_fallback: P,
 }
 
 impl<P> ClientDerivationResolver<P> {
-    fn new(params_and_fallback: P) -> Self {
+    pub(crate) fn new(params_and_fallback: P) -> Self {
         Self {
             params_and_fallback,
         }
@@ -1232,6 +1236,8 @@ where
             Ok(Some(client_derivation_proving_data()))
         } else if key.0.as_ref() == WALLET_ATTESTATION_KEY_LOCATION {
             Ok(Some(wallet_attestation_proving_data()))
+        } else if key.0.as_ref() == REGISTER_KEY_LOCATION {
+            Ok(Some(register_proving_data()))
         } else {
             self.params_and_fallback.resolve_key(key).await
         }
@@ -1277,6 +1283,22 @@ fn wallet_attestation_proving_data() -> ProvingKeyMaterial {
     }
 }
 
+/// Proving-key material for the wallet_registry `register(leaf)` circuit.
+/// Compact's static layout puts the compiled keys under `keys/register.*`,
+/// which the build pipeline copies to `circuits/static/wallet-registry/`.
+fn register_proving_data() -> ProvingKeyMaterial {
+    ProvingKeyMaterial {
+        prover_key: include_bytes!("../../../../circuits/static/wallet-registry/register.prover")
+            .to_vec(),
+        verifier_key: include_bytes!(
+            "../../../../circuits/static/wallet-registry/register.verifier"
+        )
+        .to_vec(),
+        ir_source: include_bytes!("../../../../circuits/static/wallet-registry/register.bzkir")
+            .to_vec(),
+    }
+}
+
 fn derive_local_zswap_seed_hex(
     env: &HashMap<String, String>,
     index: usize,
@@ -1309,7 +1331,7 @@ fn derive_local_zswap_seed_hex(
     Ok(String::from_utf8(output.stdout)?.trim().to_string())
 }
 
-fn repo_root_tool(relative_path: &str) -> LocalPocResult<PathBuf> {
+pub fn repo_root_tool(relative_path: &str) -> LocalPocResult<PathBuf> {
     let mut dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     loop {
         let candidate = dir.join(relative_path);

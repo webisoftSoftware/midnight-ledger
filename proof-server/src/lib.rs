@@ -29,6 +29,7 @@ use crate::worker_pool::WorkerPool;
 pub mod endpoints;
 pub mod local_poc_client;
 pub mod versioned_ir;
+pub mod wallet_registry_call;
 pub mod worker_pool;
 
 /// Log whether the explicit dev-only split registry bypass is enabled.

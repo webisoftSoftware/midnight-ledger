@@ -9,6 +9,10 @@ publish = false
 name = "local-poc-split-prove"
 path = "src/bin/local_poc_split_prove.rs"
 
+[[bin]]
+name = "local-poc-register-wallet"
+path = "src/bin/local_poc_register_wallet.rs"
+
 [features]
 default = []
 experimental = ["dep:zkir-v3"]
