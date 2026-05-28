@@ -39,6 +39,7 @@ use zkir::LocalProvingProvider;
 use zswap::keys::{SecretKeys, Seed};
 use zswap::ledger::State as ZswapLedgerState;
 use zswap::prove::ZswapResolver;
+use zswap::verify::AcceptAllRegistryRootPolicy;
 use zswap::{Delta, Input, Offer as ZswapOffer, Output as ZswapOutput, split_coin_binding_tag};
 
 pub type LocalPocResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -709,7 +710,7 @@ async fn submit_split_send_transaction(
         output_proofs.push(prove_zswap_output(output_preimage).await?);
     }
     proved_input
-        .well_formed(0)
+        .well_formed_with_registry_policy(0, &AcceptAllRegistryRootPolicy)
         .map_err(|e| format!("server split input proof is not well formed: {e}"))?;
     for (index, output_proof) in output_proofs.iter().enumerate() {
         output_proof
