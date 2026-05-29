@@ -24,7 +24,9 @@ use base_crypto::signatures::Signature;
 use base_crypto::time::Timestamp;
 use coin_structure::contract::ContractAddress;
 use ledger::construct::{ContractCallPrototype, PreTranscript, partition_transcripts};
-use ledger::structure::{Intent, LedgerParameters, ProofMarker, Transaction};
+use ledger::structure::{
+    ContractAction, Intent, LedgerParameters, ProofMarker, ProofVersioned, Transaction,
+};
 use onchain_runtime::context::QueryContext;
 use onchain_runtime::cost_model::INITIAL_COST_MODEL;
 use onchain_runtime::ops::{Key, Op, key};
@@ -42,8 +44,8 @@ use std::time::{Duration as StdDuration, SystemTime, UNIX_EPOCH};
 use storage::arena::Sp;
 use storage::db::InMemoryDB;
 use storage::storage::HashMap as StorageHashMap;
-use transient_crypto::commitment::PedersenRandomness;
-use transient_crypto::proofs::{KeyLocation, ProofPreimage};
+use transient_crypto::commitment::{PedersenRandomness, PureGeneratorPedersen};
+use transient_crypto::proofs::{KeyLocation, PARAMS_VERIFIER, ProofPreimage, VerifierKey};
 use zkir::LocalProvingProvider;
 use zswap::prove::ZswapResolver;
 
@@ -204,6 +206,13 @@ pub async fn build_register_call_tx_hex(
 
     // Step 10: seal binding randomness and serialize.
     let sealed = proven_tx.seal(OsRng);
+
+    // Step 11: local pre-flight — verify the contract-call proof against
+    // the embedded verifier key the same way the chain will. If this
+    // fails the chain will reject too (Custom error 115), but here we
+    // get the underlying `VerifyingError` instead of the opaque wire code.
+    preflight_verify_register_proof(&sealed, &contract_state)?;
+
     let mut tx_bytes = Vec::new();
     tagged_serialize(&sealed, &mut tx_bytes)?;
 
@@ -211,6 +220,89 @@ pub async fn build_register_call_tx_hex(
         registry_address,
         tx_hex: hex::encode(tx_bytes),
     })
+}
+
+/// Verify the register-call proof locally with the same VerifierKey +
+/// public inputs the chain uses. Mirrors `ContractCall::well_formed`'s
+/// V2 proof check inline. Surfaces the underlying `VerifyingError` on
+/// failure (vs the chain's lossy `Custom(115)`).
+fn preflight_verify_register_proof(
+    tx: &Transaction<Signature, ProofMarker, PureGeneratorPedersen, InMemoryDB>,
+    contract_state: &ContractState<InMemoryDB>,
+) -> LocalPocResult<()> {
+    let stx = match tx {
+        Transaction::Standard(stx) => stx,
+        _ => return Err("preflight: register tx must be Standard".into()),
+    };
+    let intent_entry = stx
+        .intents
+        .iter()
+        .find(|seg_intent| *seg_intent.0.deref() == REGISTER_SEGMENT_ID)
+        .ok_or("preflight: no intent at segment 1")?;
+    let intent = intent_entry.1.deref();
+    let parent_binding_com = intent.binding_commitment.commitment;
+    let call_action = intent
+        .actions
+        .iter_deref()
+        .find_map(|a| match a {
+            ContractAction::Call(sp) => Some(sp.deref().clone()),
+            _ => None,
+        })
+        .ok_or("preflight: intent has no ContractCall action")?;
+    let proof = match &call_action.proof {
+        ProofVersioned::V2(p) => p,
+        #[allow(unreachable_patterns)]
+        _ => return Err("preflight: unsupported proof version".into()),
+    };
+
+    let embedded_verifier_bytes: &[u8] =
+        include_bytes!("../../../../circuits/static/wallet-registry/register.verifier");
+    let embedded_vk: VerifierKey = tagged_deserialize(embedded_verifier_bytes)?;
+
+    // Pull the verifier key from the live contract state and compare. If
+    // the chain's op has a different key than the one we proved against,
+    // verification will obviously fail; surface that explicitly.
+    let chain_op = contract_state
+        .operations
+        .get(&EntryPointBuf::from(&b"register"[..]))
+        .map(|sp| sp.deref().clone())
+        .ok_or("preflight: chain contract state missing 'register' operation")?;
+    let chain_vk = chain_op
+        .latest()
+        .cloned()
+        .ok_or("preflight: chain 'register' op has no verifier key (op.v2 is None)")?;
+    let mut embedded_bytes = Vec::new();
+    serialize::Serializable::serialize(&embedded_vk, &mut embedded_bytes)?;
+    let mut chain_bytes = Vec::new();
+    serialize::Serializable::serialize(&chain_vk, &mut chain_bytes)?;
+    if embedded_bytes != chain_bytes {
+        return Err(format!(
+            "preflight: embedded verifier-key bytes ({} bytes) differ from chain op verifier-key ({} bytes)",
+            embedded_bytes.len(),
+            chain_bytes.len()
+        )
+        .into());
+    }
+    tracing::info!(
+        embedded_vk_bytes = embedded_bytes.len(),
+        chain_vk_matches = true,
+        "preflight: verifier-key bytes match between embedded artifact and chain state"
+    );
+
+    let pis = call_action.public_inputs(parent_binding_com);
+    tracing::info!(
+        pis_len = pis.len(),
+        binding_input = ?pis.first(),
+        comm_com = ?pis.get(1),
+        "preflight: computed chain-style PIs"
+    );
+
+    // Use the chain's vk (which we've just proved matches the embedded
+    // one) — same path the runtime executes.
+    chain_vk
+        .verify(&PARAMS_VERIFIER, proof, pis.iter().copied())
+        .map_err(|e| format!("preflight register-call proof verify failed: {e}"))?;
+    Ok(())
 }
 
 // ------------------------------------------------------------------ helpers
