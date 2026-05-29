@@ -12,7 +12,6 @@ use onchain_runtime::ops::{Key, Op};
 use onchain_runtime::program_fragments::Cell_write;
 use onchain_runtime::result_mode::ResultModeVerify;
 use onchain_runtime::state::StateValue;
-use rand::Rng;
 use rand::rngs::OsRng;
 use serde_json::json;
 use serialize::{Deserializable, Tagged, tagged_deserialize, tagged_serialize};
@@ -55,6 +54,13 @@ pub(crate) const REGISTER_KEY_LOCATION: &str = "register";
 const SK_COMMIT_SEPARATOR: &str = "midnight:sk-commit[v1]";
 /// Domain separator for the registration leaf `reg_leaf`.
 const REG_LEAF_SEPARATOR: &str = "midnight:wallet-reg[v1]";
+/// Domain separator for the deterministic `r` blinding factor derivation.
+/// Same wallet seed → same `r` → same `reg_leaf` → reusable across the
+/// `register-wallet` and subsequent split-spend runs.
+const SK_R_DERIVE_SEPARATOR: &str = "midnight:sk-r-derive[v1]";
+/// Domain separator for the deterministic `salt` derivation. See
+/// [`SK_R_DERIVE_SEPARATOR`] for rationale.
+const SK_SALT_DERIVE_SEPARATOR: &str = "midnight:sk-salt-derive[v1]";
 /// Height of the wallet-registry Merkle tree. Mirror of
 /// `split_prove::client::REGISTRY_TREE_HEIGHT` and the constant baked into
 /// `circuits/wallet_registry.compact` / `sk_proof.compact`.
@@ -277,7 +283,27 @@ pub async fn prove_local_wallet_split_spend(
 
     tracing::info!(stage = "derive", role = "client", "▶ CLIENT/derive");
     let derive_start = Instant::now();
-    let (handoff, proving_elapsed) = build_split_spend_handoff_timed(&wallet_spend).await?;
+    // `MIDNIGHT_LOCAL_FORCE_CORRUPT_REGISTRY_WITNESS=1` is the Phase 4
+    // negative-control hook: build a corrupted synthetic witness (real leaf
+    // at index 0 + dummy at index 1) so the resulting `registryRoot` differs
+    // structurally from the chain's `current_split_registry_root`. The
+    // per-spend proof itself is well-formed, so the proof-server roundtrip
+    // succeeds — but ledger admission MUST reject the bundle with
+    // `SplitRegistryRootNotCurrent` (this is what proves the dev-accept-all
+    // bypass is actually off).
+    let force_corrupt = env_value(&env, "MIDNIGHT_LOCAL_FORCE_CORRUPT_REGISTRY_WITNESS") == "1";
+    let (handoff, proving_elapsed) = if force_corrupt {
+        tracing::warn!(
+            "negative-control: MIDNIGHT_LOCAL_FORCE_CORRUPT_REGISTRY_WITNESS=1 \
+             — using corrupted-synthetic registry witness; admission MUST reject with \
+             SplitRegistryRootNotCurrent unless MIDNIGHT_SPLIT_REGISTRY_DEV_ACCEPT_ALL=1 \
+             is masking the check"
+        );
+        build_split_spend_handoff_inner(&wallet_spend, RegistryWitnessSource::CorruptSynthetic)
+            .await?
+    } else {
+        build_split_spend_handoff_with_chain_witness_timed(&wallet_spend, &env).await?
+    };
     timings.derive_total = derive_start.elapsed();
     timings.derive_local_proving = proving_elapsed;
     tracing::info!(
@@ -523,6 +549,59 @@ pub async fn build_split_spend_handoff(
 pub async fn build_split_spend_handoff_timed(
     spend: &LocalPocWalletSpend,
 ) -> LocalPocResult<(serde_json::Value, Duration)> {
+    build_split_spend_handoff_inner(spend, RegistryWitnessSource::Synthetic).await
+}
+
+/// Chain-aware variant of [`build_split_spend_handoff`]: reads the live
+/// `wallet_registry` contract state and builds the spend witness against
+/// the real Merkle root, instead of a synthetic single-leaf tree.
+///
+/// Requires the local node to be reachable (`MIDNIGHT_LOCAL_NODE_RPC_HTTP`
+/// env or default `http://127.0.0.1:9944`) and the wallet's `reg_leaf` to
+/// already be present on-chain (i.e. `make register-wallet` has run for
+/// this seed).
+pub async fn build_split_spend_handoff_with_chain_witness(
+    spend: &LocalPocWalletSpend,
+    env: &HashMap<String, String>,
+) -> LocalPocResult<serde_json::Value> {
+    let (value, _) =
+        build_split_spend_handoff_with_chain_witness_timed(spend, env).await?;
+    Ok(value)
+}
+
+pub async fn build_split_spend_handoff_with_chain_witness_timed(
+    spend: &LocalPocWalletSpend,
+    env: &HashMap<String, String>,
+) -> LocalPocResult<(serde_json::Value, Duration)> {
+    build_split_spend_handoff_inner(spend, RegistryWitnessSource::Chain(env)).await
+}
+
+/// Selector for which registry tree to derive the membership witness
+/// against.
+///
+/// - `Synthetic`: legacy single-leaf in-memory tree. Used by the
+///   proof-server's synthetic integration tests (no chain required) and,
+///   coincidentally, matches the chain whenever the chain has a single
+///   leaf registered at index 0 — handy for tests, NOT useful as a
+///   negative control.
+/// - `CorruptSynthetic`: single real leaf at index 0 + a dummy at index 1.
+///   The resulting tree root is structurally different from any
+///   "single leaf at 0" chain state, so admission rejects with
+///   `SplitRegistryRootNotCurrent` (proves the dev-accept-all bypass is
+///   off). The per-spend proof itself is still well-formed.
+/// - `Chain`: queries the live `wallet_registry` contract via RPC and
+///   produces a path whose root equals the chain's
+///   `current_split_registry_root`.
+enum RegistryWitnessSource<'a> {
+    Synthetic,
+    CorruptSynthetic,
+    Chain(&'a HashMap<String, String>),
+}
+
+async fn build_split_spend_handoff_inner<'a>(
+    spend: &LocalPocWalletSpend,
+    source: RegistryWitnessSource<'a>,
+) -> LocalPocResult<(serde_json::Value, Duration)> {
     let mut zswap_state_bytes = Vec::new();
     tagged_serialize(&spend.zswap_state, &mut zswap_state_bytes)?;
     let pk = spend.key.coin_secret_key.public_key();
@@ -539,11 +618,19 @@ pub async fn build_split_spend_handoff_timed(
     let registration = prove_wallet_attestation(&spend.key.coin_secret_key).await?;
     let attestation_elapsed = attestation_start.elapsed();
 
-    // Build a single-leaf registry tree mirroring the state after this wallet's
-    // synthetic first registration. This path is accepted by ledger admission
-    // only when the node/indexer process opts in with
-    // MIDNIGHT_SPLIT_REGISTRY_DEV_ACCEPT_ALL=1.
-    let registry_witness = build_first_registration_witness(&registration)?;
+    let registry_witness = match source {
+        RegistryWitnessSource::Synthetic => build_first_registration_witness(&registration)?,
+        RegistryWitnessSource::CorruptSynthetic => {
+            build_corrupt_registration_witness(&registration)?
+        }
+        RegistryWitnessSource::Chain(env) => {
+            crate::wallet_registry_call::build_chain_registration_witness(
+                registration.reg_leaf_bytes,
+                env,
+            )
+            .await?
+        }
+    };
 
     let proving_start = Instant::now();
     let client_derivation_proof = prove_client_derivation(
@@ -1100,10 +1187,35 @@ pub(crate) struct LocalPocRegistryWitness {
 fn build_first_registration_witness(
     registration: &LocalPocWalletRegistration,
 ) -> LocalPocResult<LocalPocRegistryWitness> {
+    build_synthetic_witness(registration, /* add_dummy_sibling = */ false)
+}
+
+/// Phase 4 negative-control witness: places the real `reg_leaf` at index 0
+/// AND a dummy `[0xDE; 32]` leaf at index 1 so the resulting root is
+/// structurally different from the chain's "single leaf at index 0" tree.
+/// The proof itself is fully valid (path/leaf/root are self-consistent),
+/// so the wallet → proof-server roundtrip succeeds — but ledger admission
+/// will reject the bundle with `SplitRegistryRootNotCurrent`, proving the
+/// `MIDNIGHT_SPLIT_REGISTRY_DEV_ACCEPT_ALL=1` bypass is actually off.
+fn build_corrupt_registration_witness(
+    registration: &LocalPocWalletRegistration,
+) -> LocalPocResult<LocalPocRegistryWitness> {
+    build_synthetic_witness(registration, /* add_dummy_sibling = */ true)
+}
+
+fn build_synthetic_witness(
+    registration: &LocalPocWalletRegistration,
+    add_dummy_sibling: bool,
+) -> LocalPocResult<LocalPocRegistryWitness> {
     let leaf_hash = HashOutput(registration.reg_leaf_bytes);
-    let mt = MerkleTree::<(), InMemoryDB>::blank(REGISTRY_TREE_HEIGHT)
-        .update_hash(0, leaf_hash, ())
-        .rehash();
+    let mut mt = MerkleTree::<(), InMemoryDB>::blank(REGISTRY_TREE_HEIGHT)
+        .update_hash(0, leaf_hash, ());
+    if add_dummy_sibling {
+        // Domain-separated dummy that no honest wallet would ever register.
+        let dummy = HashOutput(*b"midnight:split-prove:dummy-sib-1");
+        mt = mt.update_hash(1, dummy, ());
+    }
+    let mt = mt.rehash();
     let merkle_path = mt
         .path_for_leaf(0, ((), leaf_hash))
         .map_err(|e| format!("registry path_for_leaf failed: {e}"))?;
@@ -1118,6 +1230,14 @@ fn build_first_registration_witness(
             }
         },
     ));
+    if add_dummy_sibling {
+        tracing::info!(
+            registry_root = %hex::encode(registry_root.0.as_le_bytes()),
+            leaf = %hex::encode(registration.reg_leaf_bytes),
+            first_sibling = %hex::encode(merkle_path.path[0].sibling.0.as_le_bytes()),
+            "built CORRUPTED synthetic registration witness (Phase 4 negative control)"
+        );
+    }
     Ok(LocalPocRegistryWitness {
         merkle_path,
         registry_root,
@@ -1173,13 +1293,39 @@ fn wallet_attestation_public_transcript_inputs(reg_leaf_fr: Fr) -> Vec<Fr> {
     inputs
 }
 
-/// Generate the per-run wallet registration. Live e2e runs this once and
-/// reuses the result on every spend in that run.
+/// Derive the wallet's `(r, salt)` blinding pair deterministically from
+/// its coin secret key. The on-chain `wallet_registry` contract stores a
+/// single `reg_leaf` per wallet; for the POC's chain-aware membership
+/// witness to find that leaf again on a later spend, both the original
+/// `register-wallet` run and every subsequent split-spend run must agree
+/// on `(r, salt)` — and therefore on `reg_leaf`. The simplest seed-stable
+/// derivation that doesn't require persisting wallet state is Poseidon
+/// over the sk limbs with a domain separator.
+fn derive_blinding_pair(sk: &coin_structure::coin::SecretKey) -> (Fr, Fr) {
+    let mut sk_limbs = Vec::new();
+    sk.0.0.field_repr(&mut sk_limbs);
+    debug_assert_eq!(sk_limbs.len(), 2, "Bytes<32> must produce 2 Fr limbs");
+    let r = transient_hash(&[
+        ascii_to_fr_le(SK_R_DERIVE_SEPARATOR),
+        sk_limbs[0],
+        sk_limbs[1],
+    ]);
+    let salt = transient_hash(&[
+        ascii_to_fr_le(SK_SALT_DERIVE_SEPARATOR),
+        sk_limbs[0],
+        sk_limbs[1],
+    ]);
+    (r, salt)
+}
+
+/// Generate the per-wallet registration. Same seed → same `(r, salt)` →
+/// same `reg_leaf` across the Phase 2 `register-wallet` run and every
+/// subsequent split-spend run. Both reads use the deterministic
+/// `derive_blinding_pair` helper.
 pub async fn prove_wallet_attestation(
     sk: &coin_structure::coin::SecretKey,
 ) -> LocalPocResult<LocalPocWalletRegistration> {
-    let r: Fr = OsRng.r#gen();
-    let salt: Fr = OsRng.r#gen();
+    let (r, salt) = derive_blinding_pair(sk);
     let (_c_sk_fr, reg_leaf_fr) = derive_reg_leaf(sk, r, salt);
     let reg_leaf_bytes = upgrade_from_transient(reg_leaf_fr).0;
 

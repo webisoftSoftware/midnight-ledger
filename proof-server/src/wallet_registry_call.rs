@@ -45,12 +45,15 @@ use storage::arena::Sp;
 use storage::db::InMemoryDB;
 use storage::storage::HashMap as StorageHashMap;
 use transient_crypto::commitment::{PedersenRandomness, PureGeneratorPedersen};
+use transient_crypto::hash::{degrade_to_transient, transient_hash};
+use transient_crypto::merkle_tree::{MerkleTree, MerkleTreeDigest};
 use transient_crypto::proofs::{KeyLocation, PARAMS_VERIFIER, ProofPreimage, VerifierKey};
 use zkir::LocalProvingProvider;
 use zswap::prove::ZswapResolver;
 
 use crate::local_poc_client::{
-    ClientDerivationResolver, LocalPocResult, REGISTER_KEY_LOCATION, env_value, env_value_or,
+    ClientDerivationResolver, LocalPocRegistryWitness, LocalPocResult, REGISTER_KEY_LOCATION,
+    env_value, env_value_or,
 };
 
 /// Segment ID for the register-call intent. Segment 0 is reserved for the
@@ -358,13 +361,11 @@ async fn fetch_contract_state(
     Ok(state)
 }
 
-/// Walk the registry contract's state and locate `reg_leaf_bytes` if it
-/// already lives in the tree.
-fn find_leaf_index(
+/// Navigate the registry contract state to the active `BoundedMerkleTree<20>`
+/// at `data[0][0]`. Returns a borrow tied to the supplied `contract_state`.
+fn extract_registry_tree(
     contract_state: &ContractState<InMemoryDB>,
-    reg_leaf_bytes: [u8; 32],
-) -> LocalPocResult<Option<u64>> {
-    let leaf_hash = HashOutput(reg_leaf_bytes);
+) -> LocalPocResult<&MerkleTree<(), InMemoryDB>> {
     let top = match contract_state.data.get_ref() {
         StateValue::Array(arr) => arr,
         _ => return Err("registry contract data is not a StateValue::Array".into()),
@@ -373,16 +374,117 @@ fn find_leaf_index(
         Some(StateValue::Array(arr)) => arr,
         _ => return Err("registry data[0] is not a StateValue::Array (HistoricMerkleTree)".into()),
     };
-    let tree = match historic_tree.get(0) {
-        Some(StateValue::BoundedMerkleTree(mt)) => mt,
-        _ => return Err("registry data[0][0] is not a BoundedMerkleTree".into()),
-    };
+    match historic_tree.get(0) {
+        Some(StateValue::BoundedMerkleTree(mt)) => Ok(mt),
+        _ => Err("registry data[0][0] is not a BoundedMerkleTree".into()),
+    }
+}
+
+/// Walk the registry contract's state and locate `reg_leaf_bytes` if it
+/// already lives in the tree.
+fn find_leaf_index(
+    contract_state: &ContractState<InMemoryDB>,
+    reg_leaf_bytes: [u8; 32],
+) -> LocalPocResult<Option<u64>> {
+    let leaf_hash = HashOutput(reg_leaf_bytes);
+    let tree = extract_registry_tree(contract_state)?;
     for (index, hash) in tree.iter() {
         if hash == leaf_hash {
             return Ok(Some(index));
         }
     }
     Ok(None)
+}
+
+/// Build a registry-membership witness using the on-chain registry tree.
+///
+/// Reads the live `wallet_registry` contract state via raw substrate
+/// JSON-RPC, locates the wallet's `reg_leaf` in the active
+/// `BoundedMerkleTree<20>`, and returns a `MerklePath` against the chain's
+/// current root. This is the Phase 3 replacement for the synthetic
+/// single-leaf tree.
+///
+/// Returns an error if the contract has not been deployed yet (Phase 1
+/// missing) or if the leaf has not been registered (Phase 2's
+/// `register-wallet` flow hasn't been run for this `reg_leaf`).
+pub(crate) async fn build_chain_registration_witness(
+    reg_leaf_bytes: [u8; 32],
+    env: &HashMap<String, String>,
+) -> LocalPocResult<LocalPocRegistryWitness> {
+    let rpc_url = node_rpc_http_url(env);
+
+    let ledger_params = fetch_ledger_parameters(&rpc_url).await?;
+    let registry_address = ledger_params.split_registry_contract.ok_or(
+        "chain LedgerParameters.split_registry_contract is None; Phase 1 deploy missing",
+    )?;
+    let contract_state = fetch_contract_state(&rpc_url, registry_address).await?;
+
+    let leaf_hash = HashOutput(reg_leaf_bytes);
+    let tree_ref = extract_registry_tree(&contract_state)?;
+    // The runtime serializes the tree post-`Op::Root`, so it's already
+    // rehashed. We defensively rehash if `root()` reports `None`, otherwise
+    // `path_for_leaf` may panic.
+    let tree_owned;
+    let tree: &MerkleTree<(), InMemoryDB> = if tree_ref.root().is_some() {
+        tree_ref
+    } else {
+        tree_owned = tree_ref.rehash();
+        &tree_owned
+    };
+
+    let leaf_index = tree
+        .iter()
+        .find_map(|(idx, hash)| (hash == leaf_hash).then_some(idx))
+        .ok_or_else(|| {
+            format!(
+                "reg_leaf 0x{} not present in on-chain registry tree at 0x{} \
+                 — has `make register-wallet` been run for this wallet seed?",
+                hex::encode(reg_leaf_bytes),
+                hex::encode(registry_address.0.0)
+            )
+        })?;
+
+    let merkle_path = tree
+        .path_for_leaf(leaf_index, ((), leaf_hash))
+        .map_err(|e| format!("registry path_for_leaf({leaf_index}) failed: {e}"))?;
+
+    // Compute the root with `merkleTreePathRootNoLeafHash` semantics —
+    // matches what the circuit recomputes and what the chain stores via
+    // `tree.root()`. The cross-check below catches structural drift.
+    let computed_root = MerkleTreeDigest(merkle_path.path.iter().fold(
+        degrade_to_transient(leaf_hash),
+        |acc, entry| {
+            if entry.goes_left {
+                transient_hash(&[acc, entry.sibling.0])
+            } else {
+                transient_hash(&[entry.sibling.0, acc])
+            }
+        },
+    ));
+    let chain_root = tree
+        .root()
+        .ok_or("on-chain registry tree has no root (rehash missing)")?;
+    if chain_root != computed_root {
+        return Err(format!(
+            "registry-root mismatch at leaf {leaf_index}: chain reports 0x{} but path computes 0x{}",
+            hex::encode(chain_root.0.as_le_bytes()),
+            hex::encode(computed_root.0.as_le_bytes()),
+        )
+        .into());
+    }
+
+    tracing::info!(
+        registry_address = %hex::encode(registry_address.0.0),
+        leaf_index,
+        registry_root = %hex::encode(chain_root.0.as_le_bytes()),
+        path_len = merkle_path.path.len(),
+        "built chain-rooted registration witness from live contract state"
+    );
+
+    Ok(LocalPocRegistryWitness {
+        merkle_path,
+        registry_root: chain_root,
+    })
 }
 
 // ------------------------------------------------- JSON-RPC + SCALE plumbing
