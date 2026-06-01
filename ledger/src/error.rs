@@ -517,10 +517,9 @@ pub enum MalformedTransaction<D: DB> {
     MalformedSplitRegistryState {
         address: ContractAddress,
     },
-    SplitRegistryRootNotCurrent {
+    SplitRegistryRootNotRecognized {
         address: ContractAddress,
         registry_root: transient_crypto::merkle_tree::MerkleTreeDigest,
-        current_root: transient_crypto::merkle_tree::MerkleTreeDigest,
     },
     EffectsCheckFailure(EffectsCheckError),
     DisjointCheckFailure(DisjointCheckError<D>),
@@ -1036,14 +1035,13 @@ impl<D: DB> Display for MalformedTransaction<D> {
                 "split registry contract {:?} has malformed registry state",
                 address
             ),
-            SplitRegistryRootNotCurrent {
+            SplitRegistryRootNotRecognized {
                 address,
                 registry_root,
-                current_root,
             } => write!(
                 formatter,
-                "split registry root {:?} is not the current root {:?} for registry contract {:?}",
-                registry_root, current_root, address
+                "split registry root {:?} is not a known historic root of registry contract {:?}",
+                registry_root, address
             ),
             EffectsCheckFailure(effects_check) => effects_check.fmt(formatter),
             DisjointCheckFailure(disjoint_check) => disjoint_check.fmt(formatter),

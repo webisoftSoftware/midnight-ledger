@@ -27,6 +27,7 @@ use crate::structure::{
 use crate::structure::{SignatureKind, VerifiedTransaction};
 use crate::utils::SortedIter;
 use crate::verify::MalformedTransaction::IntentSignatureVerificationFailure;
+use base_crypto::fab::AlignedValue;
 use base_crypto::hash::HashOutput;
 use base_crypto::signatures::VerifyingKey;
 use base_crypto::time::{Duration, Timestamp};
@@ -470,10 +471,19 @@ fn split_registry_dev_accept_all() -> bool {
     std::env::var("MIDNIGHT_SPLIT_REGISTRY_DEV_ACCEPT_ALL").as_deref() == Ok("1")
 }
 
-fn current_split_registry_root<D: DB>(
+/// Returns the `HistoricMerkleTree`'s set of past roots from the registry
+/// contract state. The on-chain `HistoricMerkleTree<20, _>` is laid out as
+/// `Array[ historic_tree ]` where `historic_tree = [ BoundedMerkleTree<20>
+/// (current), Cell(insert-counter), Map(roots) ]`. Slot 2 is a `Map` keyed by
+/// every root the tree has ever held (values are null); this is exactly the set
+/// the in-circuit `HistoricMerkleTree.checkRoot` tests membership against. We
+/// validate the contract-state shape (top-level array, height-20 current tree
+/// at slot 0), then hand back the roots map so admission can accept any
+/// historic root.
+fn split_registry_root_history<D: DB>(
     contract_state: &ContractState<D>,
     address: ContractAddress,
-) -> Result<MerkleTreeDigest, MalformedTransaction<D>> {
+) -> Result<storage::storage::HashMap<AlignedValue, StateValue<D>, D>, MalformedTransaction<D>> {
     let malformed = || MalformedTransaction::MalformedSplitRegistryState { address };
     let top_level = match contract_state.data.get_ref() {
         StateValue::Array(top_level) => top_level,
@@ -483,13 +493,16 @@ fn current_split_registry_root<D: DB>(
         Some(StateValue::Array(historic_tree)) => historic_tree,
         _ => return Err(malformed()),
     };
-    let current_tree = match historic_tree.get(0) {
-        Some(StateValue::BoundedMerkleTree(current_tree)) if current_tree.height() == 20 => {
-            current_tree
-        }
+    // Shape check: slot 0 must be the height-20 current tree.
+    match historic_tree.get(0) {
+        Some(StateValue::BoundedMerkleTree(current_tree)) if current_tree.height() == 20 => {}
         _ => return Err(malformed()),
     };
-    current_tree.root().ok_or_else(malformed)
+    // Slot 2 holds the set of historic roots, keyed by root.
+    match historic_tree.get(2) {
+        Some(StateValue::Map(roots)) => Ok(roots.clone()),
+        _ => Err(malformed()),
+    }
 }
 
 fn validate_split_registry_roots<D: DB>(
@@ -513,13 +526,19 @@ fn validate_split_registry_roots<D: DB>(
         let registry_contract = registry_contract.ok_or(
             MalformedTransaction::SplitRegistryContractNotPresent(address),
         )?;
-        let current_root = current_split_registry_root(registry_contract, address)?;
+        // Accept any root the registry has ever held: admission tests
+        // membership in the contract's historic-roots map, exactly as the
+        // in-circuit `HistoricMerkleTree.checkRoot` does. This decouples
+        // admission from the bleeding-edge root, so a split proof built against
+        // root `R` stays valid even after later `register` calls advance the
+        // current root past `R`.
+        let history = split_registry_root_history(registry_contract, address)?;
         for registry_root in roots {
-            if *registry_root != current_root {
-                return Err(MalformedTransaction::SplitRegistryRootNotCurrent {
+            let key = AlignedValue::from(*registry_root);
+            if !history.contains_key(&key) {
+                return Err(MalformedTransaction::SplitRegistryRootNotRecognized {
                     address,
                     registry_root: *registry_root,
-                    current_root,
                 });
             }
         }
@@ -2055,14 +2074,21 @@ mod split_registry_tests {
     use onchain_runtime::state::ContractMaintenanceAuthority;
     use storage::{arena::Sp, db::InMemoryDB};
 
-    fn registry_contract_state(
+    /// Build a registry contract state whose historic-roots map (slot 2) holds
+    /// `roots`. Mirrors the on-chain `HistoricMerkleTree<20, _>` layout.
+    fn registry_contract_state_with_roots(
         tree: transient_crypto::merkle_tree::MerkleTree<(), InMemoryDB>,
+        roots: &[MerkleTreeDigest],
     ) -> ContractState<InMemoryDB> {
+        let mut roots_map = storage::storage::HashMap::default();
+        for root in roots {
+            roots_map = roots_map.insert(AlignedValue::from(*root), StateValue::Null);
+        }
         let historic_tree = StateValue::Array(
             vec![
                 StateValue::BoundedMerkleTree(tree),
                 StateValue::Cell(Sp::new(0u64.into())),
-                StateValue::Map(storage::storage::HashMap::default()),
+                StateValue::Map(roots_map),
             ]
             .into(),
         );
@@ -2074,23 +2100,33 @@ mod split_registry_tests {
         )
     }
 
-    #[test]
-    fn split_registry_state_parser_reads_current_tree_root() {
-        let tree = transient_crypto::merkle_tree::MerkleTree::blank(20)
-            .update_hash(0, HashOutput([7u8; 32]), ())
-            .rehash();
-        let expected_root = tree.root().expect("rehashed registry tree has a root");
-        let state = registry_contract_state(tree);
-        let address = ContractAddress(HashOutput([1u8; 32]));
+    fn registry_contract_state(
+        tree: transient_crypto::merkle_tree::MerkleTree<(), InMemoryDB>,
+    ) -> ContractState<InMemoryDB> {
+        registry_contract_state_with_roots(tree, &[])
+    }
 
-        assert_eq!(
-            current_split_registry_root(&state, address).expect("registry state parses"),
-            expected_root
-        );
+    /// A distinct, well-formed `MerkleTreeDigest` derived from a one-leaf tree.
+    fn digest(byte: u8) -> MerkleTreeDigest {
+        transient_crypto::merkle_tree::MerkleTree::<(), InMemoryDB>::blank(20)
+            .update_hash(0, HashOutput([byte; 32]), ())
+            .rehash()
+            .root()
+            .expect("rehashed tree has a root")
     }
 
     #[test]
-    fn split_registry_state_parser_rejects_malformed_state() {
+    fn split_registry_history_reader_parses_valid_state() {
+        let tree = transient_crypto::merkle_tree::MerkleTree::blank(20)
+            .update_hash(0, HashOutput([7u8; 32]), ())
+            .rehash();
+        let state = registry_contract_state(tree);
+        let address = ContractAddress(HashOutput([1u8; 32]));
+        assert!(split_registry_root_history(&state, address).is_ok());
+    }
+
+    #[test]
+    fn split_registry_history_reader_rejects_malformed_state() {
         let address = ContractAddress(HashOutput([1u8; 32]));
         let empty_top_level = ContractState::new(
             StateValue::Array(Vec::<StateValue<InMemoryDB>>::new().into()),
@@ -2098,16 +2134,43 @@ mod split_registry_tests {
             ContractMaintenanceAuthority::default(),
         );
         assert!(matches!(
-            current_split_registry_root(&empty_top_level, address),
+            split_registry_root_history(&empty_top_level, address),
             Err(MalformedTransaction::MalformedSplitRegistryState { .. })
         ));
 
         let wrong_height =
             registry_contract_state(transient_crypto::merkle_tree::MerkleTree::blank(19).rehash());
         assert!(matches!(
-            current_split_registry_root(&wrong_height, address),
+            split_registry_root_history(&wrong_height, address),
             Err(MalformedTransaction::MalformedSplitRegistryState { .. })
         ));
+    }
+
+    #[test]
+    fn split_registry_history_accepts_any_historic_root_rejects_unknown() {
+        let address = ContractAddress(HashOutput([1u8; 32]));
+        let tree = transient_crypto::merkle_tree::MerkleTree::blank(20)
+            .update_hash(0, HashOutput([9u8; 32]), ())
+            .rehash();
+        let current = tree.root().expect("rehashed registry tree has a root");
+        let old = digest(3); // a historic, non-current root
+        let unknown = digest(250);
+        // The map carries both an older root and the current root.
+        let state = registry_contract_state_with_roots(tree, &[old, current]);
+
+        let history = split_registry_root_history(&state, address).expect("registry state parses");
+        assert!(
+            history.contains_key(&AlignedValue::from(old)),
+            "a non-current historic root must be accepted"
+        );
+        assert!(
+            history.contains_key(&AlignedValue::from(current)),
+            "the current root must be accepted"
+        );
+        assert!(
+            !history.contains_key(&AlignedValue::from(unknown)),
+            "a root never registered must be rejected"
+        );
     }
 }
 
