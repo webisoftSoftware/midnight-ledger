@@ -59,7 +59,8 @@ async fn main() -> LocalPocResult<()> {
         })?;
 
     info!(stage = "attestation", "▶ deriving wallet reg_leaf");
-    let registration = prove_wallet_attestation(&keys.coin_secret_key).await?;
+    let registration =
+        prove_wallet_attestation(&keys.coin_secret_key, &env, args.key_index).await?;
     info!(
         stage = "attestation",
         reg_leaf = %hex::encode(registration.reg_leaf_bytes),

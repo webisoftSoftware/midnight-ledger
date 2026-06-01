@@ -285,22 +285,31 @@ pub async fn prove_local_wallet_split_spend(
     let derive_start = Instant::now();
     // `MIDNIGHT_LOCAL_FORCE_CORRUPT_REGISTRY_WITNESS=1` is the Phase 4
     // negative-control hook: build a corrupted synthetic witness (real leaf
-    // at index 0 + dummy at index 1) so the resulting `registryRoot` differs
-    // structurally from the chain's `current_split_registry_root`. The
-    // per-spend proof itself is well-formed, so the proof-server roundtrip
-    // succeeds — but ledger admission MUST reject the bundle with
-    // `SplitRegistryRootNotCurrent` (this is what proves the dev-accept-all
-    // bypass is actually off).
+    // at index 0 + dummy at index 1) so the resulting `registryRoot` is a tree
+    // root the chain never held — it is absent from the registry contract's
+    // historic-roots set. The per-spend proof itself is well-formed, so the
+    // proof-server roundtrip succeeds — but ledger admission MUST reject the
+    // bundle with `SplitRegistryRootNotRecognized` (this is what proves the
+    // dev-accept-all bypass is actually off). Note admission now accepts ANY
+    // historic root, so the corrupt root is rejected because it was never
+    // registered, not merely because it differs from the current root.
     let force_corrupt = env_value(&env, "MIDNIGHT_LOCAL_FORCE_CORRUPT_REGISTRY_WITNESS") == "1";
     let (handoff, proving_elapsed) = if force_corrupt {
         tracing::warn!(
             "negative-control: MIDNIGHT_LOCAL_FORCE_CORRUPT_REGISTRY_WITNESS=1 \
              — using corrupted-synthetic registry witness; admission MUST reject with \
-             SplitRegistryRootNotCurrent unless MIDNIGHT_SPLIT_REGISTRY_DEV_ACCEPT_ALL=1 \
+             SplitRegistryRootNotRecognized unless MIDNIGHT_SPLIT_REGISTRY_DEV_ACCEPT_ALL=1 \
              is masking the check"
         );
-        build_split_spend_handoff_inner(&wallet_spend, RegistryWitnessSource::CorruptSynthetic)
-            .await?
+        // Use the same BIP39-derived `(r, salt)` as the chain witness path
+        // so the wallet's `reg_leaf` still matches what's registered
+        // on-chain — only the path/root is corrupted, not the leaf itself.
+        build_split_spend_handoff_inner(
+            &wallet_spend,
+            RegistryWitnessSource::CorruptSynthetic,
+            &env,
+        )
+        .await?
     } else {
         build_split_spend_handoff_with_chain_witness_timed(&wallet_spend, &env).await?
     };
@@ -549,7 +558,8 @@ pub async fn build_split_spend_handoff(
 pub async fn build_split_spend_handoff_timed(
     spend: &LocalPocWalletSpend,
 ) -> LocalPocResult<(serde_json::Value, Duration)> {
-    build_split_spend_handoff_inner(spend, RegistryWitnessSource::Synthetic).await
+    let empty_env = HashMap::new();
+    build_split_spend_handoff_inner(spend, RegistryWitnessSource::Synthetic, &empty_env).await
 }
 
 /// Chain-aware variant of [`build_split_spend_handoff`]: reads the live
@@ -573,7 +583,7 @@ pub async fn build_split_spend_handoff_with_chain_witness_timed(
     spend: &LocalPocWalletSpend,
     env: &HashMap<String, String>,
 ) -> LocalPocResult<(serde_json::Value, Duration)> {
-    build_split_spend_handoff_inner(spend, RegistryWitnessSource::Chain(env)).await
+    build_split_spend_handoff_inner(spend, RegistryWitnessSource::Chain(env), env).await
 }
 
 /// Selector for which registry tree to derive the membership witness
@@ -585,13 +595,13 @@ pub async fn build_split_spend_handoff_with_chain_witness_timed(
 ///   leaf registered at index 0 — handy for tests, NOT useful as a
 ///   negative control.
 /// - `CorruptSynthetic`: single real leaf at index 0 + a dummy at index 1.
-///   The resulting tree root is structurally different from any
-///   "single leaf at 0" chain state, so admission rejects with
-///   `SplitRegistryRootNotCurrent` (proves the dev-accept-all bypass is
-///   off). The per-spend proof itself is still well-formed.
+///   The resulting tree root is one the chain never registered, so it is
+///   absent from the registry contract's historic-roots set and admission
+///   rejects with `SplitRegistryRootNotRecognized` (proves the dev-accept-all
+///   bypass is off). The per-spend proof itself is still well-formed.
 /// - `Chain`: queries the live `wallet_registry` contract via RPC and
-///   produces a path whose root equals the chain's
-///   `current_split_registry_root`.
+///   produces a path whose root equals the chain's current registry root
+///   (which is, of course, a member of the historic-roots set).
 enum RegistryWitnessSource<'a> {
     Synthetic,
     CorruptSynthetic,
@@ -601,21 +611,26 @@ enum RegistryWitnessSource<'a> {
 async fn build_split_spend_handoff_inner<'a>(
     spend: &LocalPocWalletSpend,
     source: RegistryWitnessSource<'a>,
+    env_for_attestation: &HashMap<String, String>,
 ) -> LocalPocResult<(serde_json::Value, Duration)> {
     let mut zswap_state_bytes = Vec::new();
     tagged_serialize(&spend.zswap_state, &mut zswap_state_bytes)?;
     let pk = spend.key.coin_secret_key.public_key();
     let coin_binding_tag = split_coin_binding_tag(&spend.coin, pk);
 
-    // Solution A wallet registration. In a real wallet this is generated once
-    // at setup, persisted, and reused across every spend; the local POC
-    // generates it fresh per run so the demo is self-contained. The
-    // attestation proof itself is *not* submitted on-chain — the
-    // contract-side `register(reg_leaf)` call accepts the leaf bytes and the
-    // permissioning argument makes attestation-proof verification
-    // unnecessary at admission time.
+    // Solution A wallet registration. Same wallet seed → same `(r, salt)` →
+    // same `reg_leaf`, both on the initial `register-wallet` run and every
+    // subsequent split spend. When a BIP39 recovery phrase is reachable via
+    // `env_for_attestation`, `(r, salt)` are derived via HKDF-SHA256 over
+    // the BIP39 seed (production-shaped); the synthetic test paths fall
+    // back to Poseidon-over-sk so they work with `StdRng`-seeded keys.
     let attestation_start = Instant::now();
-    let registration = prove_wallet_attestation(&spend.key.coin_secret_key).await?;
+    let registration = prove_wallet_attestation(
+        &spend.key.coin_secret_key,
+        env_for_attestation,
+        spend.key_index,
+    )
+    .await?;
     let attestation_elapsed = attestation_start.elapsed();
 
     let registry_witness = match source {
@@ -1191,11 +1206,11 @@ fn build_first_registration_witness(
 }
 
 /// Phase 4 negative-control witness: places the real `reg_leaf` at index 0
-/// AND a dummy `[0xDE; 32]` leaf at index 1 so the resulting root is
-/// structurally different from the chain's "single leaf at index 0" tree.
+/// AND a dummy `[0xDE; 32]` leaf at index 1 so the resulting root is one the
+/// chain never registered (it is not in the registry's historic-roots set).
 /// The proof itself is fully valid (path/leaf/root are self-consistent),
 /// so the wallet → proof-server roundtrip succeeds — but ledger admission
-/// will reject the bundle with `SplitRegistryRootNotCurrent`, proving the
+/// will reject the bundle with `SplitRegistryRootNotRecognized`, proving the
 /// `MIDNIGHT_SPLIT_REGISTRY_DEV_ACCEPT_ALL=1` bypass is actually off.
 fn build_corrupt_registration_witness(
     registration: &LocalPocWalletRegistration,
@@ -1293,15 +1308,13 @@ fn wallet_attestation_public_transcript_inputs(reg_leaf_fr: Fr) -> Vec<Fr> {
     inputs
 }
 
-/// Derive the wallet's `(r, salt)` blinding pair deterministically from
-/// its coin secret key. The on-chain `wallet_registry` contract stores a
-/// single `reg_leaf` per wallet; for the POC's chain-aware membership
-/// witness to find that leaf again on a later spend, both the original
-/// `register-wallet` run and every subsequent split-spend run must agree
-/// on `(r, salt)` — and therefore on `reg_leaf`. The simplest seed-stable
-/// derivation that doesn't require persisting wallet state is Poseidon
-/// over the sk limbs with a domain separator.
-fn derive_blinding_pair(sk: &coin_structure::coin::SecretKey) -> (Fr, Fr) {
+/// Derive the wallet's `(r, salt)` blinding pair via Poseidon over the
+/// coin secret key. POC fallback used by the synthetic integration tests
+/// (and any caller that doesn't have a BIP39 recovery phrase available):
+/// same `sk` → same `(r, salt)` → same `reg_leaf`, but without the
+/// production-shaped HKDF-from-master-seed flow. Production callers go
+/// through [`derive_blinding_pair_from_bip39`] instead.
+fn derive_blinding_pair_from_sk(sk: &coin_structure::coin::SecretKey) -> (Fr, Fr) {
     let mut sk_limbs = Vec::new();
     sk.0.0.field_repr(&mut sk_limbs);
     debug_assert_eq!(sk_limbs.len(), 2, "Bytes<32> must produce 2 Fr limbs");
@@ -1318,14 +1331,90 @@ fn derive_blinding_pair(sk: &coin_structure::coin::SecretKey) -> (Fr, Fr) {
     (r, salt)
 }
 
-/// Generate the per-wallet registration. Same seed → same `(r, salt)` →
-/// same `reg_leaf` across the Phase 2 `register-wallet` run and every
-/// subsequent split-spend run. Both reads use the deterministic
-/// `derive_blinding_pair` helper.
+/// Production-shaped derivation: HKDF-SHA256 over the BIP39 seed with a
+/// stable domain separator and the wallet's `(account, key_index)`
+/// identifier. Output is two 64-byte uniform chunks, each fed to
+/// [`Fr::from_uniform_bytes`] for unbiased reduction into the Jubjub
+/// scalar field. Shells out to [`tools/derive_midnight_wallet_blinding.mjs`]
+/// the same way the zswap-seed derivation does.
+///
+/// Returns an error if `MIDNIGHT_LOCAL_RECOVERY_PHRASE` isn't set —
+/// callers must fall back to [`derive_blinding_pair_from_sk`] for
+/// chainless/test paths.
+fn derive_blinding_pair_from_bip39(
+    env: &HashMap<String, String>,
+    key_index: usize,
+) -> LocalPocResult<(Fr, Fr)> {
+    let phrase = env_value(env, "MIDNIGHT_LOCAL_RECOVERY_PHRASE");
+    if phrase.trim().is_empty() {
+        return Err(
+            "derive_blinding_pair_from_bip39: MIDNIGHT_LOCAL_RECOVERY_PHRASE not set in env".into(),
+        );
+    }
+
+    let output = Command::new("node")
+        .arg(repo_root_tool("tools/derive_midnight_wallet_blinding.mjs")?)
+        .env("MIDNIGHT_LOCAL_RECOVERY_PHRASE", phrase)
+        .env(
+            "MIDNIGHT_LOCAL_ACCOUNT",
+            env_value(env, "MIDNIGHT_LOCAL_ACCOUNT"),
+        )
+        .env("MIDNIGHT_LOCAL_ZSWAP_KEY_INDEX", key_index.to_string())
+        .output()?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "wallet-blinding derivation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let r_hex = json
+        .get("rUniformHex")
+        .and_then(|v| v.as_str())
+        .ok_or("blinding helper missing rUniformHex")?;
+    let salt_hex = json
+        .get("saltUniformHex")
+        .and_then(|v| v.as_str())
+        .ok_or("blinding helper missing saltUniformHex")?;
+
+    let r_bytes: [u8; 64] = hex::decode(r_hex)?
+        .try_into()
+        .map_err(|v: Vec<u8>| format!("rUniformHex must be 64 bytes, got {}", v.len()))?;
+    let salt_bytes: [u8; 64] = hex::decode(salt_hex)?
+        .try_into()
+        .map_err(|v: Vec<u8>| format!("saltUniformHex must be 64 bytes, got {}", v.len()))?;
+
+    Ok((
+        Fr::from_uniform_bytes(&r_bytes),
+        Fr::from_uniform_bytes(&salt_bytes),
+    ))
+}
+
+/// Generate the per-wallet registration.
+///
+/// When a BIP39 recovery phrase is available in `env`, `(r, salt)` are
+/// derived via HKDF-SHA256 over the BIP39 seed (production-shaped). When
+/// no recovery phrase is present, falls back to a Poseidon-over-sk
+/// derivation — the synthetic integration tests rely on this so they can
+/// run with `StdRng`-seeded synthetic keys and no `.env`. Both paths are
+/// seed-stable: same wallet → same `reg_leaf` across the `register-wallet`
+/// run and every subsequent split spend.
 pub async fn prove_wallet_attestation(
     sk: &coin_structure::coin::SecretKey,
+    env: &HashMap<String, String>,
+    key_index: usize,
 ) -> LocalPocResult<LocalPocWalletRegistration> {
-    let (r, salt) = derive_blinding_pair(sk);
+    let (r, salt) = if env_value(env, "MIDNIGHT_LOCAL_RECOVERY_PHRASE")
+        .trim()
+        .is_empty()
+    {
+        derive_blinding_pair_from_sk(sk)
+    } else {
+        derive_blinding_pair_from_bip39(env, key_index)?
+    };
     let (_c_sk_fr, reg_leaf_fr) = derive_reg_leaf(sk, r, salt);
     let reg_leaf_bytes = upgrade_from_transient(reg_leaf_fr).0;
 
