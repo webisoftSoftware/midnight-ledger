@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -12,6 +12,12 @@ const wasmInput = resolve(
   process.argv[2] ??
     join(currentDir, '..', 'target', 'wasm32-unknown-unknown', 'wasm', `${wasmModule}.wasm`),
 );
+// Optional argv[3]: a directory holding wasm-bindgen output produced elsewhere
+// (e.g. inside the builder container, see Makefile `local-ledger-js`). When
+// given, we copy those bindings in instead of invoking `wasm-bindgen` on the
+// host — so the host needs no rustup/wasm-bindgen toolchain. When omitted, we
+// fall back to running `wasm-bindgen` directly (requires it on PATH).
+const bindgenDir = process.argv[3] ? resolve(process.argv[3]) : null;
 const pkgDir = join(currentDir, 'pkg');
 
 function run(command, args, options = {}) {
@@ -46,17 +52,24 @@ if (!statSync(wasmInput, { throwIfNoEntry: false })?.isFile()) {
 rmSync(pkgDir, { recursive: true, force: true });
 mkdirSync(pkgDir, { recursive: true });
 
-run('wasm-bindgen', [
-  wasmInput,
-  '--out-dir',
-  pkgDir,
-  '--target',
-  'bundler',
-  '--omit-default-module-path',
-  '--weak-refs',
-  '--reference-types',
-  '--no-typescript',
-]);
+if (bindgenDir) {
+  if (!statSync(bindgenDir, { throwIfNoEntry: false })?.isDirectory()) {
+    throw new Error(`wasm-bindgen output dir not found: ${bindgenDir}`);
+  }
+  cpSync(bindgenDir, pkgDir, { recursive: true });
+} else {
+  run('wasm-bindgen', [
+    wasmInput,
+    '--out-dir',
+    pkgDir,
+    '--target',
+    'bundler',
+    '--omit-default-module-path',
+    '--weak-refs',
+    '--reference-types',
+    '--no-typescript',
+  ]);
+}
 
 const runtimeTypes = readFileSync(join(currentDir, '..', 'onchain-runtime-wasm', 'onchain-runtime-v3.d.ts'), 'utf8');
 const ledgerTemplate = readFileSync(join(currentDir, `${packageName}.template.d.ts`), 'utf8')

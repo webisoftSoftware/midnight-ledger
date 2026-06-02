@@ -6,3 +6,10 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends clang lld ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && rustup target add wasm32-unknown-unknown
+
+# wasm-bindgen-cli must match the `wasm-bindgen` crate version pinned in
+# ledger-wasm/Cargo.toml (=0.2.104). Installing it in the builder image lets the
+# whole wasm pipeline run inside the container, so the host only needs docker +
+# node (no host rustup / wasm-bindgen / wasm-opt). Bump this in lockstep with the
+# crate.
+RUN cargo install wasm-bindgen-cli --version 0.2.104 --locked
